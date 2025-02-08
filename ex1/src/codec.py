@@ -5,7 +5,8 @@ from typing import Any, Literal
 class BVCodec:
     """
     Encoder/decoder class for Bright-Vincent-Codec.
-    Currently supports int, float, str, list, dict, bool, and None types.
+    Uses a type-length-value encoding. Currently supports
+    int, float, str, list, dict, bool, and None types.
     """
 
     # Define type codes as class constants

@@ -1,6 +1,6 @@
 import math
 import pytest
-from src.lib import BVCodec
+from src.codec import BVCodec
 
 
 @pytest.fixture
