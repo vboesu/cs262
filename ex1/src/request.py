@@ -4,8 +4,9 @@ import socket
 from src.codec import BVCodec
 from src.lib import OP_TO_CODE
 
-REQUEST_SUCCESS_CODE = 100
-REQUEST_ERROR_CODE = 40
+REQUEST_SUCCESS_CODE = 100  # response code, think HTTP 200
+REQUEST_PUSH_CODE = 42  # request code, think HTTP POST
+REQUEST_ERROR_CODE = 40  # response code, think HTTP 400
 
 
 def checksum(data: bytes, size: int = 2) -> int:

@@ -10,7 +10,12 @@ from sqlalchemy.sql import func
 
 from src.models import Base, User, Message, Token
 from src.connection import Connection
-from src.request import Request, REQUEST_SUCCESS_CODE, REQUEST_ERROR_CODE
+from src.request import (
+    Request,
+    REQUEST_SUCCESS_CODE,
+    REQUEST_ERROR_CODE,
+    REQUEST_PUSH_CODE,
+)
 from src.lib import OP_TO_CODE
 
 import config
@@ -242,7 +247,7 @@ def read_messages(connection: Connection, current_user: User, *args, **kwargs):
 
 @op("message")
 @login_required
-def message(
+def send_message(
     connection: Connection, current_user: User, to: str, content: str, *args, **kwargs
 ):
     if not to:
@@ -268,10 +273,42 @@ def message(
         raise ValueError()
 
     # If recipient is logged in, attempt to immediately deliver the message
+    print("connected", connected_clients)
     if to in connected_clients:
-        # TODO
-        print("ATTEMPTING TO DELIVER")
-        pass
+        connected_clients[to].write(
+            Request(REQUEST_PUSH_CODE, {"message": message.to_dict()})
+        )
+        print("wrote message!")
+
+        # mark message as read
+        try:
+            message.read_at = datetime.now()
+            session.commit()
+        except Exception as e:
+            print(e)
+            session.rollback()
+
+    return {"message": message.to_dict()}
+
+
+@op("delete_messages")
+@login_required
+def delete_messages(
+    connection: Connection, current_user: User, messages: list[int], *args, **kwargs
+):
+    for message_id in messages:
+        message = session.query(Message).filter_by(id=message_id).first()
+        if not message or current_user.id not in [message.from_id, message.to_id]:
+            session.rollback()
+            raise ValueError("Invalid message IDs.")
+
+        session.delete(message)
+
+    try:
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        print(e)
 
 
 @op("delete_account")

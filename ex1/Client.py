@@ -1,11 +1,19 @@
-from datetime import datetime
+import math
+import queue
+import selectors
 import socket
+import threading
 import hashlib
 import tkinter as tk
-from tkinter import messagebox, simpledialog, scrolledtext
+from tkinter import ttk, messagebox
 
-from src.lib import TIMESTAMP_FORMAT
-from src.request import send as _send
+from src.request import (
+    Request,
+    REQUEST_ERROR_CODE,
+    REQUEST_PUSH_CODE,
+    REQUEST_SUCCESS_CODE,
+    send as _send,
+)
 
 import config
 
@@ -62,17 +70,23 @@ class Client:
         self.current_user = None
         self.unread_count = 0
 
+        self.queue = queue.Queue()
+        self.listener_thread = None
+        self.stop_event = threading.Event()
+
         # Pagination attributes
         self.messages_offset = 0
-        self.messages_per_page = 2
+        self.messages_per_page = 10
         self.is_loading_messages = False
         self.has_more_messages = True
 
         self.accounts_page = 1
         self.accounts_per_page = 10
         self.accounts_search = ""
+        self.accounts_total_pages = 1  # Initialize total pages
 
-        master.title("CS 262 BVC (Bright-Vincent-Chat)")
+        self.master.title("CS 262 BVC (Bright-Vincent-Chat)")
+        self.master.protocol("WM_DELETE_WINDOW", self.on_close)
 
         # Create Login Frame (first screen)
         self.login_frame = tk.Frame(master)
@@ -132,14 +146,30 @@ class Client:
         )
         self.load_button.pack(side="left", padx=5)
 
-        # Chat display: scrollable text widget to show messages
-        self.chat_display = scrolledtext.ScrolledText(
-            self.messages_frame, wrap=tk.WORD, state=tk.DISABLED, width=50, height=15
+        # Chat display: Treeview widget to show messages
+        self.chat_treeview = ttk.Treeview(
+            self.messages_frame,
+            columns=("id", "message"),
+            show="headings",
+            selectmode="extended",
         )
-        self.chat_display.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+        self.chat_treeview.heading("message", text="Messages")
+        self.chat_treeview.column("id", width=0, stretch=False)  # Hidden column
+        self.chat_treeview.column("message", anchor="w")
+
+        # Add vertical scrollbar to Treeview
+        self.chat_scrollbar = ttk.Scrollbar(
+            self.messages_frame, orient=tk.VERTICAL, command=self.chat_treeview.yview
+        )
+        self.chat_treeview.configure(yscrollcommand=self.chat_scrollbar.set)
+        self.chat_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.chat_treeview.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
 
         # Bind the yscrollcommand to a custom method for scroll detection
-        self.chat_display.config(yscrollcommand=self.on_scroll)
+        self.chat_treeview.config(yscrollcommand=self.on_scroll)
+
+        # Bind the delete key to the delete handler
+        self.chat_treeview.bind("<BackSpace>", self.on_delete_key)
 
         # Input frame for sending messages
         self.input_frame = tk.Frame(self.messages_frame)
@@ -196,6 +226,9 @@ class Client:
         )
         self.accounts_scrollbar.pack(side="left", fill="y", pady=5)
 
+        # Bind the selection event to handler
+        self.accounts_listbox.bind("<<ListboxSelect>>", self.on_account_select)
+
         # Pagination controls for accounts (moved below the list view)
         self.accounts_pagination_frame = tk.Frame(self.accounts_frame)
         self.accounts_pagination_frame.pack(pady=5)
@@ -213,6 +246,24 @@ class Client:
         self.next_accounts_button.pack(side="left", padx=5)
 
     ### HELPER FUNCTIONS
+    def process_incoming(self):
+        try:
+            while True:
+                req = self.queue.get_nowait()
+                self.handle_incoming(req)
+        except queue.Empty:
+            pass
+        finally:
+            # Schedule the next check
+            self.master.after(100, self.process_incoming)
+
+    def handle_incoming(self, request: Request):
+        if request.request_code == REQUEST_PUSH_CODE:
+            if "message" in request.data:
+                self.prepend_chat_message(request.data["message"])
+            print("GOT DATA FROM SERVER", request)
+            print(request.data)
+
     def send(self, operation: str, data: dict | None = None):
         if self.token:
             if data is None:
@@ -221,6 +272,36 @@ class Client:
                 data["token"] = self.token
 
         return _send(self.sock, operation=operation, data=data)
+
+    def start_listener_thread(self):
+        if self.listener_thread is None or not self.listener_thread.is_alive():
+            self.stop_event.clear()
+            self.listener_thread = threading.Thread(
+                target=self.listen_to_server, daemon=True
+            )
+            self.listener_thread.start()
+            # Start checking the queue
+            self.master.after(100, self.process_incoming)
+
+    def listen_to_server(self):
+        while not self.stop_event.is_set():
+            response = b""
+            try:
+                response += self.sock.recv(4096)
+            except socket.timeout:
+                # Assume no more data is coming
+                pass
+
+            if not response:
+                # Assume connection is broken
+                messagebox.showerror("Error", "Connection to server was lost.")
+                self.on_close()
+
+            try:
+                req = Request.parse(response)
+                self.queue.put(req)
+            except Exception as e:
+                print(e)
 
     def create_account(self):
         username = self.username_entry.get().strip()
@@ -242,6 +323,7 @@ class Client:
             self.update_unread_label()
             self.load_previous_messages_page(1)
             self.load_accounts_page(1)
+            self.start_listener_thread()
         else:
             messagebox.showerror(
                 f"Error: {response.request_code}",
@@ -267,6 +349,7 @@ class Client:
             self.update_unread_label()
             self.load_previous_messages_page(1)
             self.load_accounts_page(1)
+            self.start_listener_thread()
         else:
             messagebox.showerror(
                 f"Error: {response.request_code}",
@@ -292,13 +375,11 @@ class Client:
         response = self.send("message", {"to": recipient, "content": message_text})
 
         if response.request_code == 100:
-            self.prepend_chat_message(
-                f"You to {recipient} ({datetime.utcnow().strftime(TIMESTAMP_FORMAT)}): {message_text}"
-            )
+            message = response.data.get("message")
+            assert message is not None
+            self.prepend_chat_message(message)
             self.message_entry.delete(0, tk.END)
             self.messages_offset += 1  # keep track of this message
-            # Optionally, refresh messages
-            # self.load_messages_page(self.messages_page)
         else:
             messagebox.showerror(
                 f"Error: {response.request_code}",
@@ -347,11 +428,7 @@ class Client:
                     page_offset += 1
                     continue
 
-                if message["from"] == self.current_user:
-                    display_text = f"You to {message['to']} ({message['timestamp']}): {message['content']}"
-                elif message["to"] == self.current_user:
-                    display_text = f"{message['from']} to you ({message['timestamp']}): {message['content']}"
-                self.append_chat_message(display_text)
+                self.append_chat_message(message)
 
             self.messages_offset += len(messages)
 
@@ -378,11 +455,7 @@ class Client:
                 return
 
             for message in messages:
-                if message["from"] == self.current_user:
-                    display_text = f"You to {message['to']} ({message['timestamp']}): {message['content']}"
-                elif message["to"] == self.current_user:
-                    display_text = f"{message['from']} to you ({message['timestamp']}): {message['content']}"
-                self.prepend_chat_message(display_text)
+                self.prepend_chat_message(message)
 
             self.unread_count -= len(messages)
             self.messages_offset += len(messages)
@@ -409,14 +482,83 @@ class Client:
                 print("loading next messages", self.messages_offset, next_page)
                 self.load_previous_messages_page(next_page)
 
-        # Update the scrollbar position
-        self.chat_display.yview_moveto(first)
+    def on_account_select(self, event):
+        """
+        Event handler for when an account is selected in the accounts listbox.
+        Automatically inputs the selected account's username into the recipient entry field.
+        """
+        # Get the index of the selected item
+        selection = self.accounts_listbox.curselection()
+        if selection:
+            index = selection[0]
+            username = self.accounts_listbox.get(index)
+            # Insert the username into the recipient entry
+            self.recipient_entry.delete(0, tk.END)
+            self.recipient_entry.insert(0, username)
+
+    def on_delete_key(self, event):
+        """
+        Handler for the Delete key to delete selected messages.
+        """
+        print("DELETING??")
+        selected_items = self.chat_treeview.selection()
+        if not selected_items:
+            return  # No selection to delete
+
+        confirm = messagebox.askyesno(
+            "Delete Messages",
+            f"Are you sure you want to delete the selected {len(selected_items)} message(s)?",
+        )
+        if not confirm:
+            return
+
+        message_ids = []
+        for item in selected_items:
+            message_id = self.chat_treeview.item(item, "values")[0]
+            message_ids.append(int(message_id))
+
+        # Send delete request to the server
+        response = self.send("delete_messages", {"messages": message_ids})
+
+        if response.request_code == 100:
+            # Deletion successful, remove items from Treeview
+            for item in selected_items:
+                self.chat_treeview.delete(item)
+            messagebox.showinfo("Success", "Selected messages have been deleted.")
+        else:
+            messagebox.showerror(
+                f"Error: {response.request_code}",
+                response.data.get("error", "Unknown error."),
+            )
+
+    def on_close(self):
+        """
+        Clean up sockets, threads, and windows.
+        """
+        # Signal the listener thread to stop
+        self.stop_event.set()
+        if self.listener_thread is not None:
+            self.listener_thread.join(timeout=1)
+
+        # Close the socket
+        try:
+            self.sock.close()
+        except Exception as e:
+            print(f"Error closing socket: {e}")
+
+        # Destroy the window
+        self.master.destroy()
 
     def search_accounts(self):
         pattern = self.search_entry.get().strip()
+        if (
+            pattern == self.search_entry.placeholder
+            and self.search_entry["fg"] == self.search_entry.placeholder_color
+        ):
+            pattern = ""
         self.accounts_search = pattern
         self.accounts_page = 1
-        self.load_accounts_page(self.accounts_page)
+        self.load_accounts_page(1)
 
     def load_accounts_page(self, page: int):
         response = self.send(
@@ -430,14 +572,38 @@ class Client:
 
         if response.request_code == 100:
             accounts = response.data.get("items", [])
+            total_count = response.data.get("total_count", 0)
+            self.accounts_total_pages = (
+                math.ceil(total_count / self.accounts_per_page)
+                if self.accounts_per_page > 0
+                else 1
+            )
+
+            # Clear accounts and re-add
             self.accounts_listbox.delete(0, tk.END)
             for account in accounts:
                 self.accounts_listbox.insert(tk.END, account["username"])
+
+            # Update pagination buttons
+            self.update_accounts_pagination_buttons()
         else:
             messagebox.showerror(
                 f"Error: {response.request_code}",
                 response.data.get("error", "Unknown error."),
             )
+
+    def update_accounts_pagination_buttons(self):
+        # Disable "Previous" button if on first page
+        if self.accounts_page <= 1:
+            self.prev_accounts_button.config(state=tk.DISABLED)
+        else:
+            self.prev_accounts_button.config(state=tk.NORMAL)
+
+        # Disable "Next" button if on last page
+        if self.accounts_page >= self.accounts_total_pages:
+            self.next_accounts_button.config(state=tk.DISABLED)
+        else:
+            self.next_accounts_button.config(state=tk.NORMAL)
 
     def prev_accounts_page(self):
         if self.accounts_page > 1:
@@ -445,8 +611,9 @@ class Client:
             self.load_accounts_page(self.accounts_page)
 
     def next_accounts_page(self):
-        self.accounts_page += 1
-        self.load_accounts_page(self.accounts_page)
+        if self.accounts_page < self.accounts_total_pages:
+            self.accounts_page += 1
+            self.load_accounts_page(self.accounts_page)
 
     def delete_account(self):
         confirm = messagebox.askyesno(
@@ -463,33 +630,43 @@ class Client:
                     response.data.get("error", "Unknown error."),
                 )
 
-    def append_chat_message(self, text: str):
-        self.chat_display.config(state=tk.NORMAL)
-        self.chat_display.insert(tk.END, f"{text}\n")
-        self.chat_display.config(state=tk.DISABLED)
-        self.chat_display.see(tk.END)
+    def append_chat_message(self, message: dict):
+        """
+        Append a message to the end of the Treeview.
+        """
+        if message["from"] == self.current_user:
+            display_text = (
+                f"You to {message['to']} ({message['timestamp']}): {message['content']}"
+            )
+        elif message["to"] == self.current_user:
+            display_text = f"{message['from']} to you ({message['timestamp']}): {message['content']}"
 
-    def prepend_chat_message(self, text: str):
-        self.chat_display.config(state=tk.NORMAL)
-        self.chat_display.insert(1.0, f"{text}\n")
-        self.chat_display.config(state=tk.DISABLED)
-        self.chat_display.see(1.0)
+        self.chat_treeview.insert("", "end", values=(message["id"], display_text))
+        self.chat_treeview.yview_moveto(1.0)  # Scroll to the bottom
+
+    def prepend_chat_message(self, message: dict):
+        """
+        Prepend a message to the beginning of the Treeview.
+        """
+        if message["from"] == self.current_user:
+            display_text = (
+                f"You to {message['to']} ({message['timestamp']}): {message['content']}"
+            )
+        elif message["to"] == self.current_user:
+            display_text = f"{message['from']} to you ({message['timestamp']}): {message['content']}"
+
+        self.chat_treeview.insert("", "0", values=(message["id"], display_text))
+        self.chat_treeview.yview_moveto(0.0)  # Scroll to the top
 
 
 def main():
-    try:
-        # Establish a persistent socket connection to the server.
-        sock = socket.create_connection((config.HOST, int(config.PORT)))
-    except Exception as e:
-        print("Failed to connect to server:", e)
-        return
-
     root = tk.Tk()
     root.geometry("900x600")  # default window size
-    app = Client(root, sock)
-    root.mainloop()
-    # When the UI window closes, close the socket.
-    sock.close()
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.connect((config.HOST, int(config.PORT)))
+        app = Client(root, sock)
+        root.mainloop()
 
 
 if __name__ == "__main__":
