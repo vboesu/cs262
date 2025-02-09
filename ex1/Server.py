@@ -1,344 +1,316 @@
-#!/usr/bin/env python3
-"""
-Server.py – A simple multithreaded TCP server implementing our custom wire protocol
-for a chat application. It supports the following operations:
-    1. Create Account
-    2. Login (returns unread count)
-    3. List Accounts (with optional search and pagination)
-    4. Send Message (delivers immediately if recipient online; otherwise stores for later)
-    5. Read Messages (with a page size parameter)
-    6. Delete Message (by a provided message ID)
-    7. Delete Account (deletes all associated messages)
-
-Protocol Details:
-  - The header is 8 bytes long, with the following fields (all little-endian):
-      * Version (1 byte) – currently fixed to 1.
-      * Request Code (1 byte) – identifies the operation.
-      * Flags/Status (2 bytes) – reserved for future use; set to 0.
-      * Packet Checksum (2 bytes) – computed as the sum of payload bytes modulo 65536.
-      * Payload Length (2 bytes) – number of bytes in the TLV payload.
-  - The payload is encoded as a sequence of TLV fields. Each field consists of:
-      * Field ID (1 byte)
-      * Field Length (2 bytes)
-      * Field Value (raw bytes)
-  - Composite objects (such as a full message) are encoded as a nested TLV block.
-  - Passwords are hashed deterministically using SHA-256.
-"""
-
+from datetime import datetime, timedelta
+import secrets
+import selectors
 import socket
-import threading
-import struct
-import hashlib
-import time
 
-# --- Protocol Constants ---
-HEADER_FORMAT = "<B B H H H"   # version, request_code, flags, checksum, payload_length
-HEADER_SIZE = 8
+from sqlalchemy import create_engine
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.sql import func
 
-# Request codes (operations)
-REQ_CREATE_ACCOUNT = 1
-REQ_LOGIN = 2
-REQ_LIST_ACCOUNTS = 3
-REQ_SEND_MESSAGE = 4
-REQ_READ_MESSAGES = 5
-REQ_DELETE_MESSAGE = 6
-REQ_DELETE_ACCOUNT = 7
+from src.models import Base, User, Message, Token
+from src.connection import Connection
+from src.request import Request, REQUEST_SUCCESS_CODE, REQUEST_ERROR_CODE
+from src.lib import OP_TO_CODE
 
-# Field IDs (agreed upon by both client and server)
-FIELD_USERNAME         = 1
-FIELD_PASSWORD_HASH    = 2
-FIELD_MESSAGE_CONTENT  = 3
-FIELD_SENDER           = 4
-FIELD_RECIPIENT        = 5
-FIELD_TIMESTAMP        = 6
-FIELD_MESSAGE_ID       = 7  # used for deletion (computed as SHA-256 of the composite message)
-FIELD_UNREAD_COUNT     = 8
-FIELD_SEARCH_PATTERN   = 9
-FIELD_PAGE_NUMBER      = 10
-FIELD_PAGE_SIZE        = 11
+import config
 
-# --- Global Storage ---
-# Accounts structure: maps username -> { "password": hashed_password, "unread": [messages], "read": [messages] }
-accounts = {}
-# Connected clients: maps username -> connection socket
+sel = selectors.DefaultSelector()
+
+# Connected clients: maps username -> connection
 connected_clients = {}
-# A lock to ensure thread safety when accessing shared structures
-lock = threading.Lock()
 
-# --- Helper Functions for Protocol ---
+OP_TO_ACTION = {}
 
-def compute_checksum(data: bytes) -> int:
-    """Compute checksum as the sum of payload bytes modulo 65536."""
-    return sum(data) % 65536
 
-def build_message(request_code: int, fields_bytes: bytes) -> bytes:
-    """
-    Build a complete message with header and payload.
-    Header layout (8 bytes):
-      - Version (1 byte)
-      - Request Code (1 byte)
-      - Flags/Status (2 bytes) [currently 0]
-      - Checksum (2 bytes) computed over the payload bytes
-      - Payload Length (2 bytes)
-    """
-    version = 1
-    flags = 0
-    payload_length = len(fields_bytes)
-    checksum = compute_checksum(fields_bytes)
-    header = struct.pack(HEADER_FORMAT, version, request_code, flags, checksum, payload_length)
-    return header + fields_bytes
+### HELPER FUNCTIONS
+def op(operation: str):
+    if operation not in OP_TO_CODE:
+        raise ValueError(f"Unknown operation: {operation}")
 
-def encode_field(field_id: int, field_value: bytes) -> bytes:
-    """
-    Encode one TLV field: Field ID (1 byte) + Field Length (2 bytes) + Field Value.
-    """
-    return struct.pack("<B H", field_id, len(field_value)) + field_value
+    def decorator(func):
+        OP_TO_ACTION[OP_TO_CODE[operation]] = func
+        return func
 
-def encode_fields(fields: list) -> bytes:
-    """
-    Encode a list of TLV fields.
-    Each element in 'fields' should be a tuple: (field_id, field_value).
-    Returns the concatenated byte string.
-    """
-    encoded = b""
-    for fid, fvalue in fields:
-        encoded += encode_field(fid, fvalue)
-    return encoded
+    return decorator
 
-def hash_password(password: str) -> bytes:
-    """
-    Deterministically hash a password using SHA-256.
-    Returns a 32-byte digest.
-    """
-    return hashlib.sha256(password.encode("utf-8")).digest()
 
-def parse_message(conn: socket.socket) -> tuple:
-    """
-    Read a complete message from the socket.
-    Returns a tuple (request_code, payload bytes) or None if connection closes.
-    """
-    header = conn.recv(HEADER_SIZE)
-    if len(header) < HEADER_SIZE:
-        return None
-    version, req_code, flags, checksum, payload_length = struct.unpack(HEADER_FORMAT, header)
-    payload = b""
-    while len(payload) < payload_length:
-        chunk = conn.recv(payload_length - len(payload))
-        if not chunk:
-            break
-        payload += chunk
-    if compute_checksum(payload) != checksum:
-        print("Checksum error")
-        return None
-    return req_code, payload
+def route(connection: Connection, request: Request):
+    fn = OP_TO_ACTION.get(request.request_code)
+    try:
+        if not fn:
+            raise ValueError(f"Unknown request code {request.request_code}")
 
-def decode_fields(payload: bytes) -> dict:
-    """
-    Decode TLV fields from a payload.
-    Returns a dictionary mapping field IDs to their corresponding byte values.
-    """
-    fields = {}
-    offset = 0
-    while offset + 3 <= len(payload):
-        field_id = payload[offset]
-        field_length = struct.unpack("<H", payload[offset+1:offset+3])[0]
-        offset += 3
-        field_value = payload[offset:offset+field_length]
-        fields[field_id] = field_value
-        offset += field_length
-    return fields
+        ret = fn(connection, **request.data)
+        connection.outb = Request(REQUEST_SUCCESS_CODE, ret)
 
-# --- Server Operations ---
+    except Exception as e:
+        connection.outb = Request(REQUEST_ERROR_CODE, {"error": str(e)})
 
-def handle_client(conn: socket.socket, addr):
+
+def login_required(func):
+    def decorator(*args, **kwargs):
+        token = kwargs.get("token", b"")
+
+        login_token = session.query(Token).filter_by(value=token).first()
+        if not login_token or (datetime.now() - login_token.timestamp) > timedelta(
+            minutes=int(config.TOKEN_VALIDITY)
+        ):
+            raise ValueError("Unauthorized.")
+
+        return func(*args, current_user=login_token.user, **kwargs)
+
+    return decorator
+
+
+### SERVER ACTIONS
+@op("register")
+def register(
+    connection: Connection, *args, username: str = None, password_hash: bytes = None
+):
+    if not username:
+        raise ValueError("Missing username.")
+    if not password_hash:
+        raise ValueError("Missing password hash.")
+
+    # Try adding user
+    try:
+        user = User(username=username, password_hash=password_hash)
+        session.add(user)
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        raise ValueError("User already exists.")
+
+    # Generate login token
+    connected_clients[username] = connection
+    try:
+        token = Token(user_id=user.id, value=secrets.token_bytes(32))
+        session.add(token)
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        print(e)
+
+    return {"token": token.value}
+
+
+@op("login")
+def login(
+    connection: Connection, *args, username: str = None, password_hash: bytes = None
+):
+    if not username:
+        raise ValueError("Missing username.")
+    if not password_hash:
+        raise ValueError("Missing password hash.")
+
+    user = (
+        session.query(User)
+        .filter_by(username=username, password_hash=password_hash)
+        .first()
+    )
+    if not user:
+        raise ValueError("Invalid login credentials.")
+
+    # Generate login token
+    connected_clients[username] = connection
+    try:
+        token = Token(user_id=user.id, value=secrets.token_bytes(32))
+        session.add(token)
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        print(e)
+
+    # Get number of unread messages
+    unread_query = session.query(func.count(Message.id)).filter_by(
+        to_id=user.id, read_at=None
+    )
+
+    return {"unread": session.execute(unread_query).scalar(), "token": token.value}
+
+
+@op("accounts")
+@login_required
+def list_accounts(connection: Connection, *args, **kwargs):
+    pattern = kwargs.get("pattern")
+    if pattern:
+        # case-insensitive search
+        query = session.query(User).where(User.username.ilike(pattern))
+        ct_query = session.query(func.count(User.id)).where(
+            User.username.ilike(pattern)
+        )
+    else:
+        query = session.query(User)
+        ct_query = session.query(func.count(User.id))
+
+    # Pagination
+    page = max(kwargs.get("page", 1), 1)
+    per_page = max(min(kwargs.get("per_page", 20), 100), 1)
+    query = query.limit(per_page).offset((page - 1) * per_page)
+
+    return {
+        "items": [a.to_dict() for a in session.execute(query).scalars()],
+        "page": page,
+        "per_page": per_page,
+        "total_count": session.execute(ct_query).scalar(),
+    }
+
+
+@op("unread_messages")
+@login_required
+def unread_messages(connection: Connection, current_user: User, *args, **kwargs):
+    # Get unread messages to user, oldest first
+    query = (
+        session.query(Message)
+        .filter((Message.to_id == current_user.id) & (Message.read_at.is_(None)))
+        .order_by(Message.timestamp.asc())
+    )
+    ct_query = session.query(func.count(Message.id)).filter_by(
+        to_id=current_user.id, read_at=None
+    )
+
+    # Pagination
+    page = max(kwargs.get("page", 1), 1)
+    per_page = max(min(kwargs.get("per_page", 20), 100), 1)
+    query = query.limit(per_page).offset((page - 1) * per_page)
+
+    return {
+        "items": [i.to_dict() for i in session.execute(query).scalars()],
+        "page": page,
+        "per_page": per_page,
+        "total_count": session.execute(ct_query).scalar(),
+    }
+
+
+@op("read_messages")
+@login_required
+def read_messages(connection: Connection, current_user: User, *args, **kwargs):
+    # Get unread messages to user, oldest first
+    query = (
+        session.query(Message)
+        .filter((Message.to_id == current_user.id) & (Message.read_at.is_not(None)))
+        .order_by(Message.timestamp.asc())
+    )
+    ct_query = session.query(func.count(Message.id)).filter_by(
+        to_id=current_user.id, read_at=None
+    )
+
+    # Pagination
+    page = max(kwargs.get("page", 1), 1)
+    per_page = max(min(kwargs.get("per_page", 20), 100), 1)
+    query = query.limit(per_page).offset((page - 1) * per_page)
+
+    return {
+        "items": [i.to_dict() for i in session.execute(query).scalars()],
+        "page": page,
+        "per_page": per_page,
+        "total_count": session.execute(ct_query).scalar(),
+    }
+
+
+@op("message")
+@login_required
+def message(
+    connection: Connection, current_user: User, to: str, content: str, *args, **kwargs
+):
+    if not to:
+        raise ValueError("Missing recipient.")
+    if not content:
+        raise ValueError("Missing message content.")
+
+    to_user = session.query(User).filter_by(username=to).first()
+    if not to_user:
+        raise ValueError("Recipient does not exist.")
+
+    # Create message
+    try:
+        message = Message(from_id=current_user.id, to_id=to_user.id, content=content)
+        session.add(message)
+        session.commit()
+    except Exception as e:
+        print(e)
+        session.rollback()
+        raise ValueError()
+
+    # If recipient is logged in, attempt to immediately deliver the message
+    if to in connected_clients:
+        # TODO
+        print("ATTEMPTING TO DELIVER")
+        pass
+
+
+@op("delete_account")
+@login_required
+def delete_account(connection: Connection, current_user: User, *args, **kwargs):
+    try:
+        del connected_clients[current_user.username]
+        session.delete(current_user)
+        session.commit()
+    except Exception as e:
+        print(e)
+        session.rollback()
+        connected_clients[current_user.username] = connection
+
+
+def accept_client(sock: socket.socket, selector: selectors.BaseSelector):
+    conn, addr = sock.accept()
+    print(f"Accepted connection from {addr}")
+    conn.setblocking(False)
+    Connection(conn, addr[0], addr[1], selector)
+
+
+def handle_client(key, mask):
     """
     Handle communication with a connected client.
     Maintains the current logged in username for the session.
     """
-    print(f"Client connected from {addr}")
-    current_user = None
-    try:
-        while True:
-            result = parse_message(conn)
-            if not result:
-                break
-            req_code, payload = result
-            fields = decode_fields(payload)
-            response_fields = []
-            
-            # Operation: Create Account
-            if req_code == REQ_CREATE_ACCOUNT:
-                username = fields.get(FIELD_USERNAME, b"").decode("utf-8")
-                password_hash = fields.get(FIELD_PASSWORD_HASH)
-                with lock:
-                    if username in accounts:
-                        response_fields.append((FIELD_MESSAGE_CONTENT, b"Account exists."))
-                    else:
-                        accounts[username] = {"password": password_hash, "unread": [], "read": []}
-                        current_user = username
-                        connected_clients[username] = conn
-                        response_fields.append((FIELD_MESSAGE_CONTENT, b"Account created."))
-                response = build_message(req_code, encode_fields(response_fields))
-                conn.sendall(response)
-            
-            # Operation: Login
-            elif req_code == REQ_LOGIN:
-                username = fields.get(FIELD_USERNAME, b"").decode("utf-8")
-                password_hash = fields.get(FIELD_PASSWORD_HASH)
-                with lock:
-                    if username not in accounts:
-                        response_fields.append((FIELD_MESSAGE_CONTENT, b"Account does not exist."))
-                    elif accounts[username]["password"] != password_hash:
-                        response_fields.append((FIELD_MESSAGE_CONTENT, b"Incorrect password."))
-                    else:
-                        current_user = username
-                        connected_clients[username] = conn
-                        unread_count = len(accounts[username]["unread"])
-                        response_fields.append((FIELD_UNREAD_COUNT, struct.pack("<H", unread_count)))
-                response = build_message(req_code, encode_fields(response_fields))
-                conn.sendall(response)
-            
-            # Operation: List Accounts (with optional search and pagination)
-            elif req_code == REQ_LIST_ACCOUNTS:
-                search_pattern = fields.get(FIELD_SEARCH_PATTERN, b"").decode("utf-8")
-                page_number = struct.unpack("<H", fields.get(FIELD_PAGE_NUMBER, b"\x00\x01"))[0]
-                page_size = struct.unpack("<H", fields.get(FIELD_PAGE_SIZE, b"\x00\x10"))[0]
-                with lock:
-                    matching = [u for u in accounts if search_pattern in u]
-                start = (page_number - 1) * page_size
-                end = start + page_size
-                list_str = ",".join(matching[start:end])
-                response_fields.append((FIELD_MESSAGE_CONTENT, list_str.encode("utf-8")))
-                response = build_message(req_code, encode_fields(response_fields))
-                conn.sendall(response)
-            
-            # Operation: Send Message
-            elif req_code == REQ_SEND_MESSAGE:
-                sender = fields.get(FIELD_SENDER, b"").decode("utf-8")
-                recipient = fields.get(FIELD_RECIPIENT, b"").decode("utf-8")
-                message_content = fields.get(FIELD_MESSAGE_CONTENT, b"")
-                timestamp = struct.pack("<I", int(time.time()))
-                # Create composite TLV for the message: includes sender, message content, and timestamp.
-                message_fields = [
-                    (FIELD_SENDER, sender.encode("utf-8")),
-                    (FIELD_MESSAGE_CONTENT, message_content),
-                    (FIELD_TIMESTAMP, timestamp)
-                ]
-                message_object = encode_fields(message_fields)
-                # Compute message ID deterministically (used for deletion)
-                msg_id = hashlib.sha256(message_object).digest()
-                with lock:
-                    if recipient in connected_clients:
-                        try:
-                            send_fields = [(FIELD_MESSAGE_CONTENT, message_object)]
-                            send_msg = build_message(REQ_SEND_MESSAGE, encode_fields(send_fields))
-                            connected_clients[recipient].sendall(send_msg)
-                        except Exception as e:
-                            accounts[recipient]["unread"].append(message_object)
-                    else:
-                        if recipient in accounts:
-                            accounts[recipient]["unread"].append(message_object)
-                        else:
-                            response_fields.append((FIELD_MESSAGE_CONTENT, b"Recipient does not exist."))
-                            response = build_message(req_code, encode_fields(response_fields))
-                            conn.sendall(response)
-                            continue
-                response_fields.append((FIELD_MESSAGE_CONTENT, b"Message sent."))
-                # Return the message ID for potential deletion.
-                response_fields.append((FIELD_MESSAGE_ID, msg_id))
-                response = build_message(req_code, encode_fields(response_fields))
-                conn.sendall(response)
-            
-            # Operation: Read Messages (pagination)
-            elif req_code == REQ_READ_MESSAGES:
-                num_messages = struct.unpack("<H", fields.get(FIELD_PAGE_SIZE, b"\x00\x01"))[0]
-                with lock:
-                    if current_user is None or current_user not in accounts:
-                        response_fields.append((FIELD_MESSAGE_CONTENT, b"Not logged in."))
-                    else:
-                        unread = accounts[current_user]["unread"]
-                        to_send = unread[:num_messages]
-                        accounts[current_user]["read"].extend(to_send)
-                        accounts[current_user]["unread"] = unread[num_messages:]
-                        # Join messages with "||" separator (for simplicity)
-                        messages_combined = b"||".join(to_send)
-                        response_fields.append((FIELD_MESSAGE_CONTENT, messages_combined))
-                response = build_message(req_code, encode_fields(response_fields))
-                conn.sendall(response)
-            
-            # Operation: Delete Message (by message ID)
-            elif req_code == REQ_DELETE_MESSAGE:
-                msg_id = fields.get(FIELD_MESSAGE_ID, b"")
-                with lock:
-                    if current_user is None or current_user not in accounts:
-                        response_fields.append((FIELD_MESSAGE_CONTENT, b"Not logged in."))
-                    else:
-                        found = False
-                        # Check both unread and read message lists for a matching message ID.
-                        for lst in [accounts[current_user]["unread"], accounts[current_user]["read"]]:
-                            for i, msg in enumerate(lst):
-                                if hashlib.sha256(msg).digest() == msg_id:
-                                    del lst[i]
-                                    found = True
-                                    break
-                            if found:
-                                break
-                        if found:
-                            response_fields.append((FIELD_MESSAGE_CONTENT, b"Message deleted."))
-                        else:
-                            response_fields.append((FIELD_MESSAGE_CONTENT, b"Message not found."))
-                response = build_message(req_code, encode_fields(response_fields))
-                conn.sendall(response)
-            
-            # Operation: Delete Account
-            elif req_code == REQ_DELETE_ACCOUNT:
-                with lock:
-                    if current_user is None or current_user not in accounts:
-                        response_fields.append((FIELD_MESSAGE_CONTENT, b"Not logged in."))
-                    else:
-                        del accounts[current_user]
-                        if current_user in connected_clients:
-                            del connected_clients[current_user]
-                        response_fields.append((FIELD_MESSAGE_CONTENT, b"Account deleted."))
-                        current_user = None
-                response = build_message(req_code, encode_fields(response_fields))
-                conn.sendall(response)
-            
-            else:
-                response_fields.append((FIELD_MESSAGE_CONTENT, b"Unknown operation."))
-                response = build_message(req_code, encode_fields(response_fields))
-                conn.sendall(response)
-    except Exception as e:
-        print(f"Error handling client {addr}: {e}")
-    finally:
-        conn.close()
-        with lock:
-            if current_user in connected_clients:
-                del connected_clients[current_user]
-        print(f"Client {addr} disconnected.")
+    connection = key.data
 
-def start_server(host="127.0.0.1", port=9000):
-    """
-    Start the server:
-      - Create a TCP socket.
-      - Bind to the specified host and port.
-      - Listen for incoming connections.
-      - Spawn a new thread (handle_client) for each accepted connection.
-    """
+    if mask & selectors.EVENT_READ:
+        try:
+            req = connection.read()
+            print("Read", req)
+            route(connection, req)
+        except Exception as e:
+            print(e)
+            connection.close()
+
+    if mask & selectors.EVENT_WRITE:
+        if connection.outb:
+            print("Write", connection.outb)
+            connection.write(connection.outb)
+            connection.outb = None
+
+
+def start_server():
+    # Set up sockets
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_sock.bind((host, port))
+    server_sock.bind((config.HOST, int(config.PORT)))
     server_sock.listen(5)
-    print(f"Server listening on {host}:{port}")
+    print(f"Server listening on {config.HOST}:{config.PORT}")
+
+    # Set up database
+    global session
+    engine = create_engine(config.DATABASE_URL, echo=True)
+    Base.metadata.create_all(engine)  # create tables if necessary
+    session = sessionmaker(bind=engine)()
+
+    sel.register(server_sock, selectors.EVENT_READ, data=None)
     try:
         while True:
-            conn, addr = server_sock.accept()
-            t = threading.Thread(target=handle_client, args=(conn, addr))
-            t.daemon = True
-            t.start()
+            events = sel.select(timeout=None)
+            for key, mask in events:
+                if key.data is None:
+                    accept_client(key.fileobj, sel)
+                else:
+                    handle_client(key, mask)
     except KeyboardInterrupt:
-        print("Server shutting down.")
+        print("Caught keyboard interrupt, exiting")
     finally:
         server_sock.close()
+        sel.close()
+
 
 if __name__ == "__main__":
     start_server()

@@ -13,16 +13,15 @@ class BVCodec:
     TYPE_INT = 0x01
     TYPE_FLOAT = 0x02
     TYPE_STRING = 0x03
-    TYPE_LIST = 0x04
-    TYPE_DICT = 0x05
-    TYPE_BOOL = 0x06
-    TYPE_NONE = 0x07
+    TYPE_BYTES = 0x04
+    TYPE_LIST = 0x05
+    TYPE_DICT = 0x06
+    TYPE_BOOL = 0x07
+    TYPE_NONE = 0x08
 
     def __init__(self, byteorder: Literal["little", "big"] = "little"):
         self.byteorder = byteorder
         self.bo = "<" if byteorder == "little" else ">"
-        self.bytes = bytes()
-        self.data = None
 
     ### PRIVATE + HELPER FUNCTIONS
     def _encode_int(self, obj: int) -> bytes:
@@ -68,6 +67,11 @@ class BVCodec:
     def _encode_none(self) -> bytes:
         return self.TYPE_NONE.to_bytes(1, self.byteorder) + b"\x00\x00"
 
+    def _encode_bytes(self, obj: bytes) -> bytes:
+        type_code = self.TYPE_BYTES.to_bytes(1, self.byteorder)
+        length = len(obj).to_bytes(2, self.byteorder)
+        return type_code + length + obj
+
     ### PUBLIC INTERFACE FUNCTIONS
     def encode(self, obj: Any) -> bytes:
         """
@@ -81,6 +85,8 @@ class BVCodec:
             return self._encode_float(obj)
         elif isinstance(obj, str):
             return self._encode_string(obj)
+        elif isinstance(obj, bytes):
+            return self._encode_bytes(obj)
         elif isinstance(obj, list):
             return self._encode_list(obj)
         elif isinstance(obj, dict):
@@ -119,6 +125,10 @@ class BVCodec:
                 remaining[:length].decode("utf-8"),
                 remaining[length:],
             )
+
+        elif type_code == self.TYPE_BYTES:
+            assert len(remaining) >= length
+            return remaining[:length], remaining[length:]
 
         elif type_code == self.TYPE_BOOL:
             assert len(remaining) >= length and length == 1

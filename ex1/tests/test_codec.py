@@ -69,6 +69,21 @@ def test_encode_decode_string(codec, value):
 @pytest.mark.parametrize(
     "value",
     [
+        b"",  # empty byte string
+        b"\x01",
+        "Hello, World!".encode("utf-8"),
+        b"".join([i.to_bytes(2) for i in range(1000)]),
+    ],
+)
+def test_encode_decode_bytes(codec, value):
+    decoded, remaining = codec.decode(codec.encode(value))
+    assert decoded == value, f"Failed for bytes value: {value}"
+    assert len(remaining) == 0
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
         True,
         False,
     ],
