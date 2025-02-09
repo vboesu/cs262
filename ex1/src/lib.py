@@ -10,6 +10,8 @@
 #     "delete_account": (8, tuple(), tuple()),
 # }
 
+TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
+
 OP_TO_CODE = {
     "username_exists": 1,
     "register": 2,

@@ -64,9 +64,24 @@ def login_required(func):
 
 
 ### SERVER ACTIONS
+@op("username_exists")
+def username_exists(connection: Connection, username: str, *args, **kwargs):
+    if not username:
+        raise ValueError("Missing username.")
+
+    return {
+        "exists": (
+            session.execute(
+                session.query(func.count(User.id)).filter_by(username=username)
+            ).scalar()
+            > 0
+        )
+    }
+
+
 @op("register")
 def register(
-    connection: Connection, *args, username: str = None, password_hash: bytes = None
+    connection: Connection, username: str, password_hash: bytes, *args, **kwargs
 ):
     if not username:
         raise ValueError("Missing username.")
@@ -175,8 +190,21 @@ def unread_messages(connection: Connection, current_user: User, *args, **kwargs)
     per_page = max(min(kwargs.get("per_page", 20), 100), 1)
     query = query.limit(per_page).offset((page - 1) * per_page)
 
+    items = [i for i in session.execute(query).scalars()]
+
+    try:
+        # Mark as read
+        for i in items:
+            i.read_at = datetime.now()
+
+        session.commit()
+
+    except Exception as e:
+        print(e)
+        session.rollback()
+
     return {
-        "items": [i.to_dict() for i in session.execute(query).scalars()],
+        "items": [i.to_dict() for i in items],
         "page": page,
         "per_page": per_page,
         "total_count": session.execute(ct_query).scalar(),
@@ -186,11 +214,14 @@ def unread_messages(connection: Connection, current_user: User, *args, **kwargs)
 @op("read_messages")
 @login_required
 def read_messages(connection: Connection, current_user: User, *args, **kwargs):
-    # Get unread messages to user, oldest first
+    # Get all messages with, newest first
     query = (
         session.query(Message)
-        .filter((Message.to_id == current_user.id) & (Message.read_at.is_not(None)))
-        .order_by(Message.timestamp.asc())
+        .filter(
+            ((Message.to_id == current_user.id) | (Message.from_id == current_user.id))
+            & (Message.read_at.is_not(None))
+        )
+        .order_by(Message.timestamp.desc())
     )
     ct_query = session.query(func.count(Message.id)).filter_by(
         to_id=current_user.id, read_at=None
@@ -222,6 +253,9 @@ def message(
     to_user = session.query(User).filter_by(username=to).first()
     if not to_user:
         raise ValueError("Recipient does not exist.")
+
+    if to_user.id == current_user.id:
+        raise ValueError("You cannot send messages to yourself. Find some friends!")
 
     # Create message
     try:

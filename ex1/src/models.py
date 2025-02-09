@@ -10,8 +10,9 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship, declarative_base
 from sqlalchemy.sql import func
 
+from src.lib import TIMESTAMP_FORMAT
+
 Base = declarative_base()
-TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 class User(Base):
