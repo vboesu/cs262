@@ -410,7 +410,7 @@ class Client:
         req_data = {"username": username, "password_hash": pwd_hash}
         response = self.socket_handler.send("register", req_data).get()
 
-        if response.request_code == 100:
+        if response.request_code == REQUEST_SUCCESS_CODE:
             self.token = response.data.get("token")
             self.current_user = username
             self.socket_handler.default_data["token"] = self.token
@@ -436,7 +436,7 @@ class Client:
         req_data = {"username": username, "password_hash": pwd_hash}
         response = self.socket_handler.send("login", req_data).get()
 
-        if response.request_code == 100:
+        if response.request_code == REQUEST_SUCCESS_CODE:
             self.token = response.data.get("token", None)
             self.current_user = username
             self.unread_count = response.data.get("unread", 0)
@@ -470,7 +470,7 @@ class Client:
         req_data = {"to": recipient, "content": message_text}
         response = self.socket_handler.send("message", req_data).get()
 
-        if response.request_code == 100:
+        if response.request_code == REQUEST_SUCCESS_CODE:
             message = response.data.get("message")
             assert message is not None
             self.prepend_chat_message(message)
@@ -504,7 +504,7 @@ class Client:
         req_data = {"page": page, "per_page": self.messages_per_page}
         response = self.socket_handler.send("read_messages", req_data).get()
 
-        if response.request_code == 100:
+        if response.request_code == REQUEST_SUCCESS_CODE:
             messages = response.data.get("items", [])
             if not messages:
                 self.has_more_messages = False
@@ -553,7 +553,7 @@ class Client:
         req_data = {"per_page": count}
         response = self.socket_handler.send("unread_messages", req_data).get()
 
-        if response.request_code == 100:
+        if response.request_code == REQUEST_SUCCESS_CODE:
             messages = response.data.get("items", [])
             if not messages:
                 self.is_loading_messages = False
@@ -592,7 +592,7 @@ class Client:
         }
         response = self.socket_handler.send("accounts", req_data).get()
 
-        if response.request_code == 100:
+        if response.request_code == REQUEST_SUCCESS_CODE:
             accounts = response.data.get("items", [])
             total_count = response.data.get("total_count", 0)
             self.accounts_total_pages = (
@@ -644,7 +644,7 @@ class Client:
         )
         if confirm:
             response = self.socket_handler.send("delete_account").get()
-            if response.request_code == 100:
+            if response.request_code == REQUEST_SUCCESS_CODE:
                 self.on_close()
             else:
                 messagebox.showerror(
@@ -748,7 +748,7 @@ class Client:
         req_data = {"messages": message_ids}
         response = self.socket_handler.send("delete_messages", req_data).get()
 
-        if response.request_code == 100:
+        if response.request_code == REQUEST_SUCCESS_CODE:
             # Deletion successful, remove items from Treeview
             for item in selected_items:
                 self.chat_treeview.delete(item)
