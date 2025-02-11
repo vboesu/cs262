@@ -759,6 +759,7 @@ def main(host: str, port: int):
     root.geometry("900x600")
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        logger.info("Attempting to connect to %s:%d", host, port)
         sock.connect((host, port))
         app = Client(root, sock)
         root.mainloop()
