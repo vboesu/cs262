@@ -24,21 +24,13 @@ class Connection:
         self.selector.register(self.sock, selectors.EVENT_READ, data=self)
 
     def read(self) -> Request:
-        try:
-            req = Request.receive(self.sock)
-            self.selector.modify(self.sock, selectors.EVENT_WRITE, data=self)
-            return req
-        except ConnectionResetError:
-            self.close()
-
-        return Request(0)
+        req = Request.receive(self.sock)
+        self.selector.modify(self.sock, selectors.EVENT_WRITE, data=self)
+        return req
 
     def write(self, request: Request):
-        try:
-            push(self.sock, request)
-            self.selector.modify(self.sock, selectors.EVENT_READ, data=self)
-        except BrokenPipeError:
-            self.close()
+        push(self.sock, request)
+        self.selector.modify(self.sock, selectors.EVENT_READ, data=self)
 
     def close(self):
         self.selector.unregister(self.sock)

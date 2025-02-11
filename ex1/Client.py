@@ -1,3 +1,4 @@
+import logging
 import math
 import queue
 import selectors
@@ -6,16 +7,26 @@ import threading
 import hashlib
 import tkinter as tk
 from tkinter import ttk, messagebox
+from typing import Callable
 
+from src.lib import OP_TO_CODE
 from src.request import (
     Request,
     REQUEST_ERROR_CODE,
     REQUEST_PUSH_CODE,
     REQUEST_SUCCESS_CODE,
+    push,
     send as _send,
 )
 
 import config
+
+# Set up logging
+logging.basicConfig(
+    format="%(module)s %(asctime)s %(funcName)s:%(lineno)d %(levelname)s %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
 
 ### HELPER FUNCTIONS
@@ -62,17 +73,158 @@ class PlaceholderEntry(tk.Entry):
             self.put_placeholder()
 
 
+class SocketHandler:
+    def __init__(self, sock: socket.socket, push_handler: Callable):
+        self.sock = sock
+
+        # Default data to be transmitted with each request
+        self.default_data = {}
+        self.req_id = 1
+
+        # Initialize locks
+        self.req_id_lock = threading.Lock()
+        self.pending_lock = threading.Lock()
+
+        # Initialize queues
+        self.pending: dict[int, queue.Queue] = {}
+        self.push_queue = queue.Queue()
+
+        # Set up push handling
+        self.push_handler = push_handler
+
+        # Start listening
+        self.lthread = threading.Thread(target=self.listen, daemon=True)
+        self.lthread.start()
+
+        self.pthread = threading.Thread(target=self.receive_push, daemon=True)
+        self.pthread.start()
+
+    def listen(self):
+        """
+        Listen to all data coming from the server to the socket `sock`,
+        interpret it as a `Request` and direct it either to a queue of
+        push notifications (if no `request_id` is provided) or to a queue
+        corresponding to the thread waiting for this response.
+        """
+        try:
+            while True:
+                req = Request.receive(self.sock)
+                if req.request_id == 0:
+                    # Any request that does not have a request_id is assumed
+                    # to be a push from the server
+                    self.push_queue.put(req)
+                else:
+                    # Someone is waiting for this response (hopefully), so let's
+                    # give it to them!
+                    with self.pending_lock:
+                        target_queue = self.pending.pop(req.request_id, None)
+
+                    if not target_queue:
+                        logging.info(f"Got response with unknown request_id: {req}")
+                        continue
+
+                    target_queue.put(req)
+
+        except OSError as e:
+            logging.error("Lost connection to the server: %s", str(e))
+
+        except Exception as e:
+            logging.error("%s: %s", e.__class__.__name__, str(e))
+
+        finally:
+            logging.info("Closing connection to the server.")
+            self.lthread = None  # basically: remove self after finishing
+            self.close()
+
+    def receive_push(self):
+        """
+        Wait for `listen` to add something to the `push_queue`, then
+        trigger the `push_handler` with the request that came in.
+        """
+        while True:
+            req = self.push_queue.get()
+            self.push_handler(req)
+
+    def send(
+        self, operation: str, data: dict | None = None, timeout: int = 30
+    ) -> queue.Queue[Request]:
+        """
+        Send a request to the server over the socket, specifying
+        the operation and data to be transmitted. Automatically generates
+        a `request_id` to be sent to the server for identification of
+        the response.
+
+        Parameters
+        ----------
+        operation : str
+            Name of the operation requested on the server
+        data : dict, optional
+            Key-value pairs with data. To this, the `default_data` of the
+            `SocketHandler` is added, by default None
+        timeout : int, optional
+            Timeout for request in seconds, by default 30
+
+        Returns
+        -------
+        queue.Queue
+            Queue which will contain the response from the server, once received.
+        """
+        if operation not in OP_TO_CODE:
+            raise ValueError(f"Unknown operation: {operation}")
+
+        # Generate (sort of) unique request ID
+        req_id = 0
+        with self.req_id_lock:
+            self.req_id = (self.req_id % 65536) + 1
+            req_id = self.req_id
+
+        # Prepare request data
+        if data is None and self.default_data:
+            data = self.default_data
+        elif data is not None:
+            data = {**self.default_data, **data}  # `data` should overwrite
+
+        # Create request object
+        req = Request(OP_TO_CODE[operation], data, req_id)
+
+        # Prepare response queue
+        response_queue = queue.Queue()
+
+        with self.pending_lock:
+            self.pending[req_id] = response_queue
+
+        # Push request to server
+        push(self.sock, req)
+
+        return response_queue
+
+    def close(self):
+        """
+        Clean-up of threads and socket.
+        """
+        # Close the socket
+        try:
+            self.sock.close()
+        except Exception as e:
+            logging.error("%s: %s", e.__class__.__name__, str(e))
+
+        if self.lthread is not None:
+            self.lthread.join(timeout=1)
+
+        if self.pthread is not None:
+            self.pthread.join(timeout=1)
+
+
 class Client:
     def __init__(self, master, sock: socket.socket):
         self.master = master
-        self.sock = sock  # the persistent socket connection
         self.token = None
         self.current_user = None
         self.unread_count = 0
 
-        self.queue = queue.Queue()
-        self.listener_thread = None
-        self.stop_event = threading.Event()
+        # Connection
+        self.sock = sock  # the persistent socket connection
+        self.socket_handler = SocketHandler(sock, self.on_push)
 
         # Pagination attributes
         self.messages_offset = 0
@@ -246,63 +398,6 @@ class Client:
         self.next_accounts_button.pack(side="left", padx=5)
 
     ### HELPER FUNCTIONS
-    def process_incoming(self):
-        try:
-            while True:
-                req = self.queue.get_nowait()
-                self.handle_incoming(req)
-        except queue.Empty:
-            pass
-        finally:
-            # Schedule the next check
-            self.master.after(100, self.process_incoming)
-
-    def handle_incoming(self, request: Request):
-        if request.request_code == REQUEST_PUSH_CODE:
-            if "message" in request.data:
-                self.prepend_chat_message(request.data["message"])
-            print("GOT DATA FROM SERVER", request)
-            print(request.data)
-
-    def send(self, operation: str, data: dict | None = None):
-        if self.token:
-            if data is None:
-                data = {"token": self.token}
-            else:
-                data["token"] = self.token
-
-        return _send(self.sock, operation=operation, data=data)
-
-    def start_listener_thread(self):
-        if self.listener_thread is None or not self.listener_thread.is_alive():
-            self.stop_event.clear()
-            self.listener_thread = threading.Thread(
-                target=self.listen_to_server, daemon=True
-            )
-            self.listener_thread.start()
-            # Start checking the queue
-            self.master.after(100, self.process_incoming)
-
-    def listen_to_server(self):
-        while not self.stop_event.is_set():
-            response = b""
-            try:
-                response += self.sock.recv(4096)
-            except socket.timeout:
-                # Assume no more data is coming
-                pass
-
-            if not response:
-                # Assume connection is broken
-                messagebox.showerror("Error", "Connection to server was lost.")
-                self.on_close()
-
-            try:
-                req = Request.parse(response)
-                self.queue.put(req)
-            except Exception as e:
-                print(e)
-
     def create_account(self):
         username = self.username_entry.get().strip()
         password = self.password_entry.get().strip()
@@ -312,18 +407,17 @@ class Client:
 
         pwd_hash = hash_password(password)
 
-        response = self.send(
-            "register", {"username": username, "password_hash": pwd_hash}
-        )
+        req_data = {"username": username, "password_hash": pwd_hash}
+        response = self.socket_handler.send("register", req_data).get()
 
         if response.request_code == 100:
             self.token = response.data.get("token")
             self.current_user = username
+            self.socket_handler.default_data["token"] = self.token
             self.show_chat_interface()
             self.update_unread_label()
             self.load_previous_messages_page(1)
             self.load_accounts_page(1)
-            self.start_listener_thread()
         else:
             messagebox.showerror(
                 f"Error: {response.request_code}",
@@ -339,17 +433,18 @@ class Client:
 
         pwd_hash = hash_password(password)
 
-        response = self.send("login", {"username": username, "password_hash": pwd_hash})
+        req_data = {"username": username, "password_hash": pwd_hash}
+        response = self.socket_handler.send("login", req_data).get()
 
         if response.request_code == 100:
             self.token = response.data.get("token", None)
             self.current_user = username
             self.unread_count = response.data.get("unread", 0)
+            self.socket_handler.default_data["token"] = self.token
             self.show_chat_interface()
             self.update_unread_label()
             self.load_previous_messages_page(1)
             self.load_accounts_page(1)
-            self.start_listener_thread()
         else:
             messagebox.showerror(
                 f"Error: {response.request_code}",
@@ -372,7 +467,8 @@ class Client:
             messagebox.showerror("Error", "Recipient and message cannot be empty.")
             return
 
-        response = self.send("message", {"to": recipient, "content": message_text})
+        req_data = {"to": recipient, "content": message_text}
+        response = self.socket_handler.send("message", req_data).get()
 
         if response.request_code == 100:
             message = response.data.get("message")
@@ -405,9 +501,8 @@ class Client:
 
         self.is_loading_messages = True
 
-        response = self.send(
-            "read_messages", {"page": page, "per_page": self.messages_per_page}
-        )
+        req_data = {"page": page, "per_page": self.messages_per_page}
+        response = self.socket_handler.send("read_messages", req_data).get()
 
         if response.request_code == 100:
             messages = response.data.get("items", [])
@@ -444,9 +539,19 @@ class Client:
         self.is_loading_messages = False
 
     def load_unread_messages(self, count: int = 1):
+        """
+        Load a specified number of messages that were sent to us
+        while we were not online.
+
+        Parameters
+        ----------
+        count : int, optional
+            Number of undelivered messages to load, by default 1
+        """
         self.is_loading_messages = True
 
-        response = self.send("unread_messages", {"per_page": count})
+        req_data = {"per_page": count}
+        response = self.socket_handler.send("unread_messages", req_data).get()
 
         if response.request_code == 100:
             messages = response.data.get("items", [])
@@ -468,87 +573,6 @@ class Client:
 
         self.is_loading_messages = False
 
-    def on_scroll(self, first, last):
-        try:
-            first_float = float(first)
-            last_float = float(last)
-        except ValueError:
-            return
-
-        if last_float >= 1.0:
-            # User has scrolled to the bottom, load next page of messages
-            if self.has_more_messages and not self.is_loading_messages:
-                next_page = (self.messages_offset // self.messages_per_page) + 1
-                print("loading next messages", self.messages_offset, next_page)
-                self.load_previous_messages_page(next_page)
-
-    def on_account_select(self, event):
-        """
-        Event handler for when an account is selected in the accounts listbox.
-        Automatically inputs the selected account's username into the recipient entry field.
-        """
-        # Get the index of the selected item
-        selection = self.accounts_listbox.curselection()
-        if selection:
-            index = selection[0]
-            username = self.accounts_listbox.get(index)
-            # Insert the username into the recipient entry
-            self.recipient_entry.delete(0, tk.END)
-            self.recipient_entry.insert(0, username)
-
-    def on_delete_key(self, event):
-        """
-        Handler for the Delete key to delete selected messages.
-        """
-        print("DELETING??")
-        selected_items = self.chat_treeview.selection()
-        if not selected_items:
-            return  # No selection to delete
-
-        confirm = messagebox.askyesno(
-            "Delete Messages",
-            f"Are you sure you want to delete the selected {len(selected_items)} message(s)?",
-        )
-        if not confirm:
-            return
-
-        message_ids = []
-        for item in selected_items:
-            message_id = self.chat_treeview.item(item, "values")[0]
-            message_ids.append(int(message_id))
-
-        # Send delete request to the server
-        response = self.send("delete_messages", {"messages": message_ids})
-
-        if response.request_code == 100:
-            # Deletion successful, remove items from Treeview
-            for item in selected_items:
-                self.chat_treeview.delete(item)
-            messagebox.showinfo("Success", "Selected messages have been deleted.")
-        else:
-            messagebox.showerror(
-                f"Error: {response.request_code}",
-                response.data.get("error", "Unknown error."),
-            )
-
-    def on_close(self):
-        """
-        Clean up sockets, threads, and windows.
-        """
-        # Signal the listener thread to stop
-        self.stop_event.set()
-        if self.listener_thread is not None:
-            self.listener_thread.join(timeout=1)
-
-        # Close the socket
-        try:
-            self.sock.close()
-        except Exception as e:
-            print(f"Error closing socket: {e}")
-
-        # Destroy the window
-        self.master.destroy()
-
     def search_accounts(self):
         pattern = self.search_entry.get().strip()
         if (
@@ -561,14 +585,12 @@ class Client:
         self.load_accounts_page(1)
 
     def load_accounts_page(self, page: int):
-        response = self.send(
-            "accounts",
-            {
-                "pattern": self.accounts_search,
-                "page": page,
-                "per_page": self.accounts_per_page,
-            },
-        )
+        req_data = {
+            "pattern": self.accounts_search,
+            "page": page,
+            "per_page": self.accounts_per_page,
+        }
+        response = self.socket_handler.send("accounts", req_data).get()
 
         if response.request_code == 100:
             accounts = response.data.get("items", [])
@@ -621,9 +643,9 @@ class Client:
             "Are you sure you want to delete your account? This action cannot be undone.",
         )
         if confirm:
-            response = self.send("delete_account")
+            response = self.socket_handler.send("delete_account").get()
             if response.request_code == 100:
-                self.master.destroy()
+                self.on_close()
             else:
                 messagebox.showerror(
                     f"Error: {response.request_code}",
@@ -642,7 +664,7 @@ class Client:
             display_text = f"{message['from']} to you ({message['timestamp']}): {message['content']}"
 
         self.chat_treeview.insert("", "end", values=(message["id"], display_text))
-        self.chat_treeview.yview_moveto(1.0)  # Scroll to the bottom
+        # self.chat_treeview.yview_moveto(1.0)  # Scroll to the bottom
 
     def prepend_chat_message(self, message: dict):
         """
@@ -657,6 +679,92 @@ class Client:
 
         self.chat_treeview.insert("", "0", values=(message["id"], display_text))
         self.chat_treeview.yview_moveto(0.0)  # Scroll to the top
+
+    ### EVENT HANDLERS
+    def on_push(self, request: Request):
+        """
+        Handle push notifications from the server. For now,
+        this is just incoming messages.
+
+        Parameters
+        ----------
+        request : Request
+            Request pushed from the server
+        """
+        if "message" in request.data:
+            self.prepend_chat_message(request.data["message"])
+
+    def on_scroll(self, first, last):
+        """
+        Event handler for scroll in the messages box, used for
+        infinite scroll of previous messages.
+        """
+        try:
+            last_float = float(last)
+        except ValueError:
+            return
+
+        if last_float >= 1.0:
+            # User has scrolled to the bottom, load next page of messages
+            if self.has_more_messages and not self.is_loading_messages:
+                next_page = (self.messages_offset // self.messages_per_page) + 1
+                self.load_previous_messages_page(next_page)
+
+    def on_account_select(self, *args):
+        """
+        Event handler for when an account is selected in the accounts listbox.
+        Automatically inputs the selected account's username into the recipient entry field.
+        """
+        # Get the index of the selected item
+        selection = self.accounts_listbox.curselection()
+        if selection:
+            index = selection[0]
+            username = self.accounts_listbox.get(index)
+            # Insert the username into the recipient entry
+            self.recipient_entry.delete(0, tk.END)
+            self.recipient_entry.insert(0, username)
+
+    def on_delete_key(self, *args):
+        """
+        Handler for the Delete key to delete selected messages.
+        """
+        selected_items = self.chat_treeview.selection()
+        if not selected_items:
+            return  # No selection to delete
+
+        confirm = messagebox.askyesno(
+            "Delete Messages",
+            f"Are you sure you want to delete the selected {len(selected_items)} message(s)?",
+        )
+        if not confirm:
+            return
+
+        message_ids = []
+        for item in selected_items:
+            message_id = self.chat_treeview.item(item, "values")[0]
+            message_ids.append(int(message_id))
+
+        # Send delete request to the server
+        req_data = {"messages": message_ids}
+        response = self.socket_handler.send("delete_messages", req_data).get()
+
+        if response.request_code == 100:
+            # Deletion successful, remove items from Treeview
+            for item in selected_items:
+                self.chat_treeview.delete(item)
+            messagebox.showinfo("Success", "Selected messages have been deleted.")
+        else:
+            messagebox.showerror(
+                f"Error: {response.request_code}",
+                response.data.get("error", "Unknown error."),
+            )
+
+    def on_close(self):
+        """
+        Clean up sockets, threads, and windows.
+        """
+        self.master.destroy()
+        self.socket_handler.close()
 
 
 def main():

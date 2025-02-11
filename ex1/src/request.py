@@ -73,7 +73,7 @@ class HeaderV1(Header):
     spec: list[str] = [
         ("B", "version", 1),
         ("B", "request_code", 0),
-        ("H", "flags", 0),
+        ("H", "request_id", 0),
         ("H", "payload_checksum", 0),
         ("H", "payload_length", 0),
     ]
@@ -91,17 +91,21 @@ class HeaderV1(Header):
 class Request:
     header_cls: type = HeaderV1
 
-    def __init__(self, request_code: int, data: dict | None = None, flags: int = 0):
+    def __init__(
+        self, request_code: int, data: dict | None = None, request_id: int = 0
+    ):
         self.request_code = request_code
         self.data = data
-        self.flags = flags
+        self.request_id = request_id
 
     def serialize(self) -> bytes:
         codec = BVCodec()
         payload = codec.encode(self.data)
 
         # Create header with request arguments
-        header = self.header_cls(request_code=self.request_code, flags=self.flags)
+        header = self.header_cls(
+            request_code=self.request_code, request_id=self.request_id
+        )
         header.update_with_payload(payload)
 
         return header.encode() + payload
@@ -121,7 +125,7 @@ class Request:
         if len(remaining) > 0:
             print("WARNING: unparsed bytes at the end of payload")
 
-        return Request(header.request_code, decoded, header.flags)
+        return Request(header.request_code, decoded, header.request_id)
 
     @classmethod
     def receive(cls, sock: socket.socket) -> "Request":
@@ -155,7 +159,7 @@ class Request:
         if len(remaining) > 0:
             print("WARNING: unparsed bytes at the end of payload")
 
-        return Request(header.request_code, decoded, header.flags)
+        return Request(header.request_code, decoded, header.request_id)
 
 
 ### OPERATIONS
