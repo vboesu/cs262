@@ -6,18 +6,12 @@ import logging
 from typing import Callable
 
 from sqlalchemy import create_engine
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm.session import Session
 from sqlalchemy.sql import func
 
 from src.models import Base, User, Message, Token
-from src.connection import Connection
-from src.request import (
-    Request,
-    REQUEST_SUCCESS_CODE,
-    REQUEST_ERROR_CODE,
-    REQUEST_PUSH_CODE,
-)
+from src.request import Request, RequestCode
 from src.lib import CODE_TO_OP, OP_TO_CODE
 
 import config
@@ -32,9 +26,45 @@ logger = logging.getLogger(__name__)
 sel = selectors.DefaultSelector()
 
 # Connected clients: maps username -> connection
-connected_clients: dict[str, Connection] = {}
+connected_clients: dict[str, "ServerSocketHandler"] = {}
 
 OP_TO_ACTION: dict[str, Callable] = {}
+
+
+class ServerSocketHandler:
+    def __init__(
+        self,
+        sock: socket.socket,
+        addr: str,
+        port: int,
+        selector: selectors.BaseSelector,
+    ):
+        self.sock = sock
+        self.addr = addr
+        self.port = port
+        self.selector = selector
+
+        self.outb: Request = None
+        self.token = None
+
+        # Mark connection as ready for reads
+        self.selector.register(self.sock, selectors.EVENT_READ, data=self)
+
+    def read(self) -> Request:
+        req = Request.receive(self.sock)
+        self.selector.modify(self.sock, selectors.EVENT_WRITE, data=self)
+        return req
+
+    def write(self, request: Request):
+        total, sent = request.push(self.sock)
+        if total != sent:
+            raise RuntimeError("Unable to write full request.")
+
+        self.selector.modify(self.sock, selectors.EVENT_READ, data=self)
+
+    def close(self):
+        self.selector.unregister(self.sock)
+        self.sock.close()
 
 
 ### HELPER FUNCTIONS
@@ -62,7 +92,7 @@ def op(operation: str) -> Callable:
     Examples
     --------
     >>> @op("register")
-    ... def register(connection: Connection, username: str, password_hash: bytes, *args, **kwargs):
+    ... def register(connection: ServerSocketHandler, username: str, password_hash: bytes, *args, **kwargs):
     ...     print(f"Registering user: {username}")
     ...     # Implementation details here...
     """
@@ -76,7 +106,7 @@ def op(operation: str) -> Callable:
     return decorator
 
 
-def route(connection: Connection, request: Request):
+def route(connection: ServerSocketHandler, request: Request):
     """
     Route an incoming request to the appropriate operation handler and
     return a response.
@@ -89,7 +119,7 @@ def route(connection: Connection, request: Request):
 
     Parameters
     ----------
-    connection : Connection
+    connection : ServerSocketHandler
         The active connection object. This function updates its ``outb`` attribute
         with a ``Request`` object, representing either a success or error response.
     request : Request
@@ -115,12 +145,12 @@ def route(connection: Connection, request: Request):
             )
 
         ret = OP_TO_ACTION[request.request_code](connection, **request.data)
-        connection.outb = Request(REQUEST_SUCCESS_CODE, ret, request.request_id)
+        connection.outb = Request(RequestCode.success, ret, request.request_id)
 
     except Exception as e:
         logger.error("%s: %s", e.__class__, str(e))
         connection.outb = Request(
-            REQUEST_ERROR_CODE, {"error": str(e)}, request.request_id
+            RequestCode.error, {"error": str(e)}, request.request_id
         )
 
 
@@ -166,9 +196,25 @@ def login_required(func: Callable) -> Callable:
     return decorator
 
 
+def error_(message: str):
+    raise ValueError(message)
+
+
+def soft_commit(session: Session, on_rollback: Callable = None):
+    try:
+        session.commit()
+    except Exception as e:
+        logger.error("%s: %s", e.__class__.__name__, str(e))
+        session.rollback()
+
+        # Handling
+        if on_rollback:
+            on_rollback(session, e)
+
+
 ### SERVER ACTIONS
 @op("username_exists")
-def username_exists(connection: Connection, username: str, *args, **kwargs):
+def username_exists(connection: ServerSocketHandler, username: str, *args, **kwargs):
     """
     Checks if an account with the specified username exists.
     """
@@ -187,7 +233,11 @@ def username_exists(connection: Connection, username: str, *args, **kwargs):
 
 @op("register")
 def register(
-    connection: Connection, username: str, password_hash: bytes, *args, **kwargs
+    connection: ServerSocketHandler,
+    username: str,
+    password_hash: bytes,
+    *args,
+    **kwargs,
 ):
     """
     Creates a new account with the specified username and password_hash. Since the
@@ -215,30 +265,27 @@ def register(
         raise ValueError("Missing password hash.")
 
     # Try adding user
-    try:
-        user = User(username=username, password_hash=password_hash)
-        session.add(user)
-        session.commit()
-    except IntegrityError:
-        session.rollback()
-        raise ValueError("User already exists.")
+    user = User(username=username, password_hash=password_hash)
+    session.add(user)
+    soft_commit(session, on_rollback=lambda: error_("User already exists."))
 
     # Generate login token
     connected_clients[username] = connection
-    try:
-        token = Token(user_id=user.id, value=secrets.token_bytes(32))
-        session.add(token)
-        session.commit()
-    except Exception as e:
-        logger.error("%s: %s", e.__class__.__name__, str(e))
-        session.rollback()
-        raise ValueError("Unable to generate login token.")
+    token = Token(user_id=user.id, value=secrets.token_bytes(32))
+    session.add(token)
+    soft_commit(session, on_rollback=lambda: error_("Unable to generate login token."))
 
     return {"token": token.value}
 
 
 @op("login")
-def login(connection: Connection, username: str, password_hash: bytes, *args, **kwargs):
+def login(
+    connection: ServerSocketHandler,
+    username: str,
+    password_hash: bytes,
+    *args,
+    **kwargs,
+):
     """
     Attempts to log in a user based on the provided username and password_hash.
 
@@ -270,13 +317,9 @@ def login(connection: Connection, username: str, password_hash: bytes, *args, **
 
     # Generate login token
     connected_clients[username] = connection
-    try:
-        token = Token(user_id=user.id, value=secrets.token_bytes(32))
-        session.add(token)
-        session.commit()
-    except Exception as e:
-        logger.error("%s: %s", e.__class__.__name__, str(e))
-        session.rollback()
+    token = Token(user_id=user.id, value=secrets.token_bytes(32))
+    session.add(token)
+    soft_commit(session, on_rollback=lambda: error_("Unable to generate login token."))
 
     # Get number of unread messages
     unread_query = session.query(func.count(Message.id)).filter_by(
@@ -289,7 +332,7 @@ def login(connection: Connection, username: str, password_hash: bytes, *args, **
 @op("accounts")
 @login_required
 def list_accounts(
-    connection: Connection,
+    connection: ServerSocketHandler,
     *args,
     pattern: str = None,
     page: int = 1,
@@ -343,7 +386,7 @@ def list_accounts(
 @op("unread_messages")
 @login_required
 def unread_messages(
-    connection: Connection,
+    connection: ServerSocketHandler,
     current_user: User,
     *args,
     per_page: int = 20,
@@ -381,16 +424,11 @@ def unread_messages(
 
     items = [i for i in session.execute(query).scalars()]
 
-    try:
-        # Mark as read
-        for i in items:
-            i.read_at = datetime.now()
+    # Mark as read
+    for i in items:
+        i.read_at = datetime.now()
 
-        session.commit()
-
-    except Exception as e:
-        logger.error("%s: %s", e.__class__.__name__, str(e))
-        session.rollback()
+    soft_commit(session)
 
     return {
         "items": [i.to_dict() for i in items],
@@ -403,7 +441,7 @@ def unread_messages(
 @op("read_messages")
 @login_required
 def read_messages(
-    connection: Connection,
+    connection: ServerSocketHandler,
     current_user: User,
     *args,
     page: int = 1,
@@ -457,7 +495,12 @@ def read_messages(
 @op("message")
 @login_required
 def send_message(
-    connection: Connection, current_user: User, to: str, content: str, *args, **kwargs
+    connection: ServerSocketHandler,
+    current_user: User,
+    to: str,
+    content: str,
+    *args,
+    **kwargs,
 ):
     """
     Send a message to another user, identified by their username. If the recipient
@@ -488,29 +531,22 @@ def send_message(
         raise ValueError("You cannot send messages to yourself. Find some friends!")
 
     # Create message
-    try:
-        message = Message(from_id=current_user.id, to_id=to_user.id, content=content)
-        session.add(message)
-        session.commit()
-    except Exception as e:
-        logger.error("%s: %s", e.__class__.__name__, str(e))
-        session.rollback()
-        raise ValueError("Unable to send message. Try again later.")
+    message = Message(from_id=current_user.id, to_id=to_user.id, content=content)
+    session.add(message)
+    soft_commit(
+        session,
+        on_rollback=lambda: error_("Unable to send message. Try again later."),
+    )
 
     # If recipient is logged in, attempt to immediately deliver the message
     if to in connected_clients:
         try:
-            connected_clients[to].write(
-                Request(REQUEST_PUSH_CODE, {"message": message.to_dict()})
-            )
+            req_data = {"message": message.to_dict()}
+            connected_clients[to].write(Request(RequestCode.push, req_data))
 
-            try:
-                # mark message as read
-                message.read_at = datetime.now()
-                session.commit()
-            except Exception as e:
-                logger.error("%s: %s", e.__class__.__name__, str(e))
-                session.rollback()
+            # mark message as read
+            message.read_at = datetime.now()
+            soft_commit(session)
 
         except Exception as e:
             logger.error("%s: %s", e.__class__.__name__, str(e))
@@ -522,7 +558,11 @@ def send_message(
 @op("delete_messages")
 @login_required
 def delete_messages(
-    connection: Connection, current_user: User, messages: list[int], *args, **kwargs
+    connection: ServerSocketHandler,
+    current_user: User,
+    messages: list[int],
+    *args,
+    **kwargs,
 ):
     """
     Delete a set of messages. All messages must be valid messages which include
@@ -542,27 +582,21 @@ def delete_messages(
 
         session.delete(message)
 
-    try:
-        session.commit()
-    except Exception as e:
-        logger.error("%s: %s", e.__class__.__name__, str(e))
-        session.rollback()
+    soft_commit(session)
 
 
 @op("delete_account")
 @login_required
-def delete_account(connection: Connection, current_user: User, *args, **kwargs):
+def delete_account(
+    connection: ServerSocketHandler, current_user: User, *args, **kwargs
+):
     """
     Delete account of current user.
     """
-    try:
-        del connected_clients[current_user.username]
-        session.delete(current_user)
-        session.commit()
-    except Exception as e:
-        logger.error("%s: %s", e.__class__.__name__, str(e))
-        session.rollback()
-        connected_clients[current_user.username] = connection
+    del connected_clients[current_user.username]
+    session.delete(current_user)
+
+    soft_commit(session)
 
 
 def accept_client(sock: socket.socket, selector: selectors.BaseSelector):
@@ -572,7 +606,7 @@ def accept_client(sock: socket.socket, selector: selectors.BaseSelector):
     conn, addr = sock.accept()
     logger.info(f"Accepted connection from {addr}")
     conn.setblocking(False)
-    Connection(conn, addr[0], addr[1], selector)
+    ServerSocketHandler(conn, addr[0], addr[1], selector)
 
 
 def handle_client(key, mask):

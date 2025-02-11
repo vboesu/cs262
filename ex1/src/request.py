@@ -2,11 +2,12 @@ import struct
 import socket
 
 from src.codec import BVCodec
-from src.lib import OP_TO_CODE
 
-REQUEST_SUCCESS_CODE = 100  # response code, think HTTP 200
-REQUEST_PUSH_CODE = 42  # request code, think HTTP POST
-REQUEST_ERROR_CODE = 40  # response code, think HTTP 400
+
+class RequestCode:
+    success = 100  # response code, think HTTP 200
+    push = 42  # request code, think HTTP POST
+    error = 40  # response code, think HTTP 400
 
 
 def checksum(data: bytes, size: int = 2) -> int:
@@ -161,6 +162,27 @@ class Request:
 
     @classmethod
     def receive(cls, sock: socket.socket) -> "Request":
+        """
+        Receive data from socket. Blocks until full Request object
+        has been received.
+
+        Parameters
+        ----------
+        sock : socket.socket
+            Socket to receive data on
+
+        Returns
+        -------
+        Request
+            Parsed request.
+
+        Raises
+        ------
+        ValueError
+            _description_
+        ValueError
+            _description_
+        """
         # Receive header
         header_size = cls.header_cls.size()
         header_data = b""
@@ -192,73 +214,3 @@ class Request:
             print("WARNING: unparsed bytes at the end of payload")
 
         return Request(header.request_code, decoded, header.request_id)
-
-
-### OPERATIONS
-def push(sock: socket.socket, request: Request) -> int:
-    """
-    Send data to socket without waiting for a response.
-
-    Parameters
-    ----------
-    sock : socket.socket
-        Destination socket
-    request : Request
-        Request
-
-    Returns
-    -------
-    int
-        Total number of bytes sent to socket.
-
-    Raises
-    ------
-    RuntimeError
-        Invalid socket
-    """
-    encoded = request.serialize()
-
-    # Send data
-    total_sent = 0
-    while total_sent < len(encoded):
-        sent = sock.send(encoded[total_sent:])
-        if sent == 0:
-            raise RuntimeError("Socket connection broken.")
-        total_sent += sent
-
-    print(f"Sent {total_sent} bytes successfully.")
-    return total_sent
-
-
-def send(sock: socket.socket, operation: str, data: dict | None = None) -> Request:
-    op_code = OP_TO_CODE.get(operation, 0)
-
-    if op_code == 0:
-        print(f"WARNING: unknown operation {operation}.")
-
-    # # Perform sanity checks on operations
-    # if req_diff := set(op_args_req) - set(data.keys()):
-    #     print(f"WARNING: Request is missing required arguments {req_diff}")
-
-    # FUTURE: confirm optional arguments
-
-    try:
-        # Send to socket
-        request = Request(op_code, data)
-        push(sock, request)
-
-        # Wait for response
-        response = b""
-        try:
-            response += sock.recv(4096)
-        except socket.timeout:
-            # Assume no more data is coming
-            pass
-
-        print(f"[CLIENT] Received {len(response)} bytes")
-        print(response)
-
-        return Request.parse(response)
-
-    except (socket.timeout, socket.error, RuntimeError) as e:
-        print(f"Error: {e}")
