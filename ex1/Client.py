@@ -16,7 +16,7 @@ import config
 # Set up logging
 logging.basicConfig(
     format="%(module)s %(asctime)s %(funcName)s:%(lineno)d %(levelname)s %(message)s",
-    level=logging.INFO,
+    level=logging.DEBUG,
 )
 logger = logging.getLogger(__name__)
 
@@ -101,6 +101,8 @@ class ClientSocketHandler:
         try:
             while True:
                 req = Request.receive(self.sock)
+                logger.debug("Received %s", req)
+                logger.debug("Data: %s", req.data)
                 if req.request_id == 0:
                     # Any request that does not have a request_id is assumed
                     # to be a push from the server
@@ -272,7 +274,7 @@ class Client:
         # Info labels
         self.info_label = tk.Label(self.messages_frame, text="Logged in as: ")
         self.info_label.pack(anchor="w")
-        self.unread_label = tk.Label(self.messages_frame, text="Unread messages: 0")
+        self.unread_label = tk.Label(self.messages_frame, text="Unread messages:")
         self.unread_label.pack(anchor="w")
 
         # Unread loader
@@ -490,9 +492,6 @@ class Client:
             messages = response.data.get("items", [])
             if messages:
                 self.update_message_store(messages)
-                # unread_count goes down by however many we retrieved
-                self.unread_count = max(0, self.unread_count - len(messages))
-                self.update_unread_label()
                 self.refresh_chat_view()
             else:
                 self.has_more_messages = False
@@ -523,6 +522,9 @@ class Client:
             messages = response.data.get("items", [])
             if messages:
                 self.update_message_store(messages)
+                # unread_count goes down by however many we retrieved
+                self.unread_count = max(0, self.unread_count - len(messages))
+                self.update_unread_label()
                 self.refresh_chat_view()
 
         else:
