@@ -1,3 +1,4 @@
+import argparse
 import logging
 import math
 import queue
@@ -753,15 +754,28 @@ class Client:
         self.socket_handler.close()
 
 
-def main():
+def main(host: str, port: int):
     root = tk.Tk()
     root.geometry("900x600")
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.connect((config.HOST, int(config.PORT)))
+        sock.connect((host, port))
         app = Client(root, sock)
         root.mainloop()
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Start the server")
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="Host/IP to bind to (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(config.PORT),
+        help=f"Port number to bind to (default: {config.PORT})",
+    )
+    args = parser.parse_args()
+    main(args.host, args.port)
