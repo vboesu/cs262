@@ -1,8 +1,17 @@
+import json
 import struct
 from typing import Any, Literal
 
 
-class BVCodec:
+class Codec:
+    def encode(self, obj: Any) -> bytes:
+        pass
+
+    def decode(self, data: bytes) -> tuple[Any, bytes]:
+        pass
+
+
+class BVCodec(Codec):
     """
     Encoder/decoder class for Bright-Vincent-Codec.
     Uses a type-length-value encoding. Currently supports
@@ -157,3 +166,14 @@ class BVCodec:
             return dct, remaining
 
         raise ValueError(f"Unknown type code: {type_code}")
+
+
+class JSONCodec(Codec):
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def encode(self, obj: Any) -> bytes:
+        return json.dumps(obj).encode("utf-8")
+
+    def decode(self, data: bytes) -> tuple[Any, bytes]:
+        return json.loads(data), b""

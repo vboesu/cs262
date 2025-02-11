@@ -1,7 +1,7 @@
 import struct
 import socket
 
-from src.codec import BVCodec
+from src.codec import BVCodec, JSONCodec
 
 
 class RequestCode:
@@ -91,6 +91,7 @@ class HeaderV1(Header):
 
 class Request:
     header_cls: type = HeaderV1
+    codec_cls: type = BVCodec
 
     def __init__(
         self, request_code: int, data: dict | None = None, request_id: int = 0
@@ -100,7 +101,7 @@ class Request:
         self.request_id = request_id
 
     def serialize(self) -> bytes:
-        codec = BVCodec()
+        codec = self.codec_cls()
         payload = codec.encode(self.data)
 
         # Create header with request arguments
@@ -120,7 +121,7 @@ class Request:
         header.verify_payload(payload)
 
         # Decode data
-        codec = BVCodec()
+        codec = cls.codec_cls()
         decoded, remaining = codec.decode(payload)
 
         if len(remaining) > 0:
@@ -207,7 +208,7 @@ class Request:
             payload_data += data
 
         # Decode payload
-        codec = BVCodec()
+        codec = cls.codec_cls()
         decoded, remaining = codec.decode(payload_data)
 
         if len(remaining) > 0:

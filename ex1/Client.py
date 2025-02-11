@@ -23,12 +23,12 @@ logger = logging.getLogger(__name__)
 
 
 ### HELPER FUNCTIONS
-def hash_password(password: str) -> bytes:
+def hash_password(password: str) -> str:
     """
     Deterministically hash the password using SHA-256.
     Returns a 32-byte digest.
     """
-    return hashlib.sha256(password.encode("utf-8")).digest()
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 
 ### CUSTOM VIEW ELEMENTS
@@ -220,7 +220,7 @@ class Client:
         # so we can unify read/unread/pushed messages and reorder them properly.
         self.messages_by_id = {}
         self.messages_per_page = 10
-        self.messages_page = 1
+        self.messages_page = 0
         self.is_loading_messages = False
         self.has_more_messages = True
 

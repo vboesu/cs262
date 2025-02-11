@@ -24,7 +24,7 @@ class User(Base):
 
     id = Column(Integer, primary_key=True)
     username = Column(String(50), unique=True, nullable=False)
-    password_hash = Column(BLOB, nullable=False)
+    password_hash = Column(String(64), nullable=False)
 
     # Relationship to Messages
     sent = relationship(
@@ -91,7 +91,7 @@ class Token(Base):
 
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    value = Column(BLOB, nullable=False)
+    value = Column(String(64), nullable=False)
     timestamp = Column(DateTime, server_default=func.now(), nullable=False)
 
     user = relationship("User", back_populates="tokens")

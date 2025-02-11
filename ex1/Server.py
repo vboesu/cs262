@@ -272,7 +272,7 @@ def register(
 
     # Generate login token
     connected_clients[username] = connection
-    token = Token(user_id=user.id, value=secrets.token_bytes(32))
+    token = Token(user_id=user.id, value=secrets.token_hex(32))
     session.add(token)
     soft_commit(session, on_rollback=lambda: error_("Unable to generate login token."))
 
@@ -318,7 +318,7 @@ def login(
 
     # Generate login token
     connected_clients[username] = connection
-    token = Token(user_id=user.id, value=secrets.token_bytes(32))
+    token = Token(user_id=user.id, value=secrets.token_hex(32))
     session.add(token)
     soft_commit(session, on_rollback=lambda: error_("Unable to generate login token."))
 
