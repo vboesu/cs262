@@ -1,8 +1,7 @@
 import pytest
 import socket
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
-from src.codec import BVCodec
 from src.request import Request, Header, HeaderV1, RequestCode, checksum
 
 
