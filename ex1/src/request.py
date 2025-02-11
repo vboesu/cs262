@@ -127,6 +127,38 @@ class Request:
 
         return Request(header.request_code, decoded, header.request_id)
 
+    def push(self, sock: socket.socket) -> tuple[int, int]:
+        """
+        Send data to socket without waiting for a response.
+
+        Parameters
+        ----------
+        sock : socket.socket
+            Destination socket
+
+        Returns
+        -------
+        tuple[int, int]
+            Total number of bytes of request, total number of bytes sent.
+
+        Raises
+        ------
+        RuntimeError
+            Invalid socket
+        """
+        encoded = self.serialize()
+
+        # Send data
+        total_sent = 0
+        while total_sent < len(encoded):
+            sent = sock.send(encoded[total_sent:])
+            if sent == 0:
+                raise RuntimeError("Socket connection broken.")
+            total_sent += sent
+
+        print(f"Sent {total_sent} bytes successfully.")
+        return len(encoded), total_sent
+
     @classmethod
     def receive(cls, sock: socket.socket) -> "Request":
         # Receive header
@@ -163,8 +195,9 @@ class Request:
 
 
 ### OPERATIONS
-def push(sock: socket.socket, request: Request):
-    """Send data to socket without waiting for a response.
+def push(sock: socket.socket, request: Request) -> int:
+    """
+    Send data to socket without waiting for a response.
 
     Parameters
     ----------
@@ -173,6 +206,11 @@ def push(sock: socket.socket, request: Request):
     request : Request
         Request
 
+    Returns
+    -------
+    int
+        Total number of bytes sent to socket.
+
     Raises
     ------
     RuntimeError
@@ -180,18 +218,16 @@ def push(sock: socket.socket, request: Request):
     """
     encoded = request.serialize()
 
-    try:
-        # Send data
-        total_sent = 0
-        while total_sent < len(encoded):
-            sent = sock.send(encoded[total_sent:])
-            if sent == 0:
-                raise RuntimeError("Socket connection broken.")
-            total_sent += sent
-        print(f"Sent {total_sent} bytes successfully.")
+    # Send data
+    total_sent = 0
+    while total_sent < len(encoded):
+        sent = sock.send(encoded[total_sent:])
+        if sent == 0:
+            raise RuntimeError("Socket connection broken.")
+        total_sent += sent
 
-    except (socket.timeout, socket.error, RuntimeError) as e:
-        print(f"Error: {e}")
+    print(f"Sent {total_sent} bytes successfully.")
+    return total_sent
 
 
 def send(sock: socket.socket, operation: str, data: dict | None = None) -> Request:

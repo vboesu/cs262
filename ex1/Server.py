@@ -498,7 +498,6 @@ def send_message(
         raise ValueError("Unable to send message. Try again later.")
 
     # If recipient is logged in, attempt to immediately deliver the message
-    print("connected", connected_clients)
     if to in connected_clients:
         try:
             connected_clients[to].write(
@@ -515,7 +514,6 @@ def send_message(
 
         except Exception as e:
             logger.error("%s: %s", e.__class__.__name__, str(e))
-            connected_clients[to].close()
             del connected_clients[to]
 
     return {"message": message.to_dict()}

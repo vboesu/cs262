@@ -29,7 +29,10 @@ class Connection:
         return req
 
     def write(self, request: Request):
-        push(self.sock, request)
+        total, sent = request.push(self.sock)
+        if total != sent:
+            raise RuntimeError("Unable to write full request.")
+
         self.selector.modify(self.sock, selectors.EVENT_READ, data=self)
 
     def close(self):

@@ -12,11 +12,8 @@ from typing import Callable
 from src.lib import OP_TO_CODE
 from src.request import (
     Request,
-    REQUEST_ERROR_CODE,
-    REQUEST_PUSH_CODE,
     REQUEST_SUCCESS_CODE,
     push,
-    send as _send,
 )
 
 import config
