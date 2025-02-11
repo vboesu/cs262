@@ -4,6 +4,9 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
+# General
+DEBUG = bool(os.getenv("DEBUG", False))
+
 # Database setup
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///app.db")
 

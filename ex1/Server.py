@@ -1,3 +1,4 @@
+import argparse
 from datetime import datetime, timedelta
 import secrets
 import selectors
@@ -636,16 +637,21 @@ def handle_client(key, mask):
                 connection.close()
 
 
-def start_server():
+def start_server(host: str, port: int):
     # Set up sockets
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_sock.bind((config.HOST, int(config.PORT)))
+    server_sock.bind((host, port))
     server_sock.listen(5)
-    logger.info(f"Server listening on {config.HOST}:{config.PORT}")
+    logger.info("Server listening on %s:%d", host, port)
+
+    # Get IP address on local network
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as dns_sock:
+        dns_sock.connect(("8.8.8.8", 80))
+        logger.info("Local IP address: %s", dns_sock.getsockname()[0])
 
     # Set up database
     global session
-    engine = create_engine(config.DATABASE_URL, echo=True)
+    engine = create_engine(config.DATABASE_URL, echo=config.DEBUG)
     Base.metadata.create_all(engine)  # create tables if necessary
     session = sessionmaker(bind=engine)()
 
@@ -666,4 +672,17 @@ def start_server():
 
 
 if __name__ == "__main__":
-    start_server()
+    parser = argparse.ArgumentParser(description="Start the server")
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="Host/IP to bind to (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(config.PORT),
+        help=f"Port number to bind to (default: {config.PORT})",
+    )
+    args = parser.parse_args()
+    start_server(args.host, args.port)
