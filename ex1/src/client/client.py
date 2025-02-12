@@ -1,220 +1,32 @@
-import argparse
 import logging
 import math
-import queue
 import socket
-import threading
-import hashlib
 import tkinter as tk
-from tkinter import ttk, messagebox
-from typing import Callable
+from tkinter import ttk
+from tkinter import messagebox
 
-from src.lib import OP_TO_CODE
-from src.request import Request, RequestCode
+from src.common import hash_password, Request, RequestCode
 
-import config
+from .socket import ClientSocketHandler
+from .views import PlaceholderEntry
 
-# Set up logging
-logging.basicConfig(
-    format="%(module)s %(asctime)s %(funcName)s:%(lineno)d %(levelname)s %(message)s",
-    level=logging.DEBUG,
-)
 logger = logging.getLogger(__name__)
 
 
-### HELPER FUNCTIONS
-def hash_password(password: str) -> str:
-    """
-    Deterministically hash the password using SHA-256.
-    Returns a 32-byte digest.
-    """
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
-
-
-### CUSTOM VIEW ELEMENTS
-class PlaceholderEntry(tk.Entry):
-    """
-    A subclass of tk.Entry that includes placeholder text functionality.
-    """
-
-    def __init__(self, master=None, placeholder="PLACEHOLDER", color="grey", **kwargs):
-        super().__init__(master, **kwargs)
-
-        self.placeholder = placeholder
-        self.placeholder_color = color
-        self.default_fg_color = self["fg"]
-
-        self.bind("<FocusIn>", self.foc_in)
-        self.bind("<FocusOut>", self.foc_out)
-
-        self.put_placeholder()
-
-    def put_placeholder(self):
-        """Insert placeholder text and set the color to placeholder color."""
-        self.insert(0, self.placeholder)
-        self["fg"] = self.placeholder_color
-
-    def foc_in(self, *args):
-        """Remove placeholder text when focus is gained."""
-        if self["fg"] == self.placeholder_color:
-            self.delete("0", "end")
-            self["fg"] = self.default_fg_color
-
-    def foc_out(self, *args):
-        """Re-insert placeholder text if entry is empty when focus is lost."""
-        if not self.get():
-            self.put_placeholder()
-
-
-class ClientSocketHandler:
-    def __init__(self, sock: socket.socket, push_handler: Callable):
-        self.sock = sock
-
-        # Default data to be transmitted with each request
-        self.default_data = {}
-        self.req_id = 1
-
-        # Initialize locks
-        self.req_id_lock = threading.Lock()
-        self.pending_lock = threading.Lock()
-
-        # Initialize queues
-        self.pending: dict[int, queue.Queue] = {}
-        self.push_queue = queue.Queue()
-
-        # Set up push handling
-        self.push_handler = push_handler
-
-        # Start listening
-        self.lthread = threading.Thread(target=self.listen, daemon=True)
-        self.lthread.start()
-
-        self.pthread = threading.Thread(target=self.receive_push, daemon=True)
-        self.pthread.start()
-
-    def listen(self):
-        """
-        Listen to all data coming from the server to the socket `sock`,
-        interpret it as a `Request`, and direct it either to a queue of
-        push notifications (if no `request_id` is provided) or to a queue
-        corresponding to the thread waiting for this response.
-        """
-        try:
-            while True:
-                req = Request.receive(self.sock)
-                logger.debug("Received %s", req)
-                logger.debug("Data: %s", req.data)
-                if req.request_id == 0:
-                    # Any request that does not have a request_id is assumed
-                    # to be a push from the server
-                    self.push_queue.put(req)
-                else:
-                    # Someone is waiting for this response (hopefully), so let's
-                    # give it to them!
-                    with self.pending_lock:
-                        target_queue = self.pending.pop(req.request_id, None)
-
-                    if not target_queue:
-                        logging.info(f"Got response with unknown request_id: {req}")
-                        continue
-
-                    target_queue.put(req)
-
-        except OSError as e:
-            logging.error("Lost connection to the server: %s", str(e))
-
-        except Exception as e:
-            logging.error("%s: %s", e.__class__.__name__, str(e))
-
-        finally:
-            logging.info("Closing connection to the server.")
-            # NOTE(vboesu): this modification is definitely not thread-safe
-            self.lthread = None  # basically: remove self after finishing
-            self.close()
-
-    def receive_push(self):
-        """
-        Wait for `listen` to add something to the `push_queue`, then
-        trigger the `push_handler` with the request that came in.
-        """
-        while True:
-            req = self.push_queue.get()
-            self.push_handler(req)
-
-    def send(
-        self, operation: str, data: dict | None = None, timeout: int = 30
-    ) -> queue.Queue[Request]:
-        """
-        Send a request to the server over the socket, specifying
-        the operation and data to be transmitted. Automatically generates
-        a `request_id` to be sent to the server for identification of
-        the response.
-
-        Parameters
-        ----------
-        operation : str
-            Name of the operation requested on the server
-        data : dict, optional
-            Key-value pairs with data. To this, the `default_data` of the
-            `ClientSocketHandler` is added, by default None
-        timeout : int, optional
-            Timeout for request in seconds, by default 30
-
-        Returns
-        -------
-        queue.Queue
-            Queue which will contain the response from the server, once received.
-        """
-        if operation not in OP_TO_CODE:
-            raise ValueError(f"Unknown operation: {operation}")
-
-        with self.req_id_lock:
-            self.req_id = (self.req_id % 65536) + 1
-            req_id = self.req_id
-
-        # Merge default_data
-        if data is None and self.default_data:
-            data = self.default_data
-        elif data is not None:
-            data = {**self.default_data, **data}  # `data` should overwrite
-
-        req = Request(OP_TO_CODE[operation], data, req_id)
-
-        # Prepare response queue
-        response_queue = queue.Queue()
-        with self.pending_lock:
-            self.pending[req_id] = response_queue
-
-        # Push request to server
-        total, sent = req.push(self.sock)
-        if sent != total:
-            logging.error("Unable to send full request. Sent %d/%d bytes.", sent, total)
-
-        return response_queue
-
-    def close(self):
-        """Clean-up of threads and socket."""
-        try:
-            self.sock.close()
-        except Exception as e:
-            logging.error("%s: %s", e.__class__.__name__, str(e))
-
-        if self.lthread is not None:
-            self.lthread.join(timeout=1)
-        if self.pthread is not None:
-            self.pthread.join(timeout=1)
-
-
 class Client:
-    def __init__(self, master, sock: socket.socket):
-        self.master = master
+    def __init__(self, host, port):
+        self.root = tk.Tk()
         self.token = None
         self.current_user = None
         self.unread_count = 0
 
         # Connection
-        self.sock = sock  # the persistent socket connection
-        self.socket_handler = ClientSocketHandler(sock, self.on_push)
+        self.host = host
+        self.port = port
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.connect((host, port))
+
+        self.socket_handler = ClientSocketHandler(self.sock, self.on_push)
 
         # CHANGED: store messages in a dictionary keyed by message id
         # so we can unify read/unread/pushed messages and reorder them properly.
@@ -235,11 +47,11 @@ class Client:
         self.accounts_total_pages = 1  # Initialize total pages
 
         # UI setup
-        self.master.title("CS 262 BVC (Bright-Vincent-Chat)")
-        self.master.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.title("CS 262 BVC (Bright-Vincent-Chat)")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         # Create frames
-        self.login_frame = tk.Frame(master)
+        self.login_frame = tk.Frame(self.root)
         self.login_frame.pack(padx=10, pady=10)
 
         tk.Label(self.login_frame, text="Username:").grid(row=0, column=0, sticky="e")
@@ -258,7 +70,7 @@ class Client:
         self.create_button.grid(row=2, column=0, pady=5)
         self.login_button.grid(row=2, column=1, pady=5)
 
-        self.chat_frame = tk.Frame(master)
+        self.chat_frame = tk.Frame(self.root)
         self.paned_window = tk.PanedWindow(
             self.chat_frame, orient=tk.HORIZONTAL, sashrelief=tk.RAISED
         )
@@ -750,33 +562,5 @@ class Client:
                 )
 
     def on_close(self):
-        self.master.destroy()
+        self.root.destroy()
         self.socket_handler.close()
-
-
-def main(host: str, port: int):
-    root = tk.Tk()
-    root.geometry("900x600")
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        logger.info("Attempting to connect to %s:%d", host, port)
-        sock.connect((host, port))
-        app = Client(root, sock)
-        root.mainloop()
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Start the server")
-    parser.add_argument(
-        "--host",
-        default="0.0.0.0",
-        help="Host/IP to bind to (default: 0.0.0.0)",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=int(config.PORT),
-        help=f"Port number to bind to (default: {config.PORT})",
-    )
-    args = parser.parse_args()
-    main(args.host, args.port)

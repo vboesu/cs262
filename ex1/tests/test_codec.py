@@ -1,10 +1,11 @@
 import math
 import pytest
-from src.codec import BVCodec
+
+from src.common import Codec, BVCodec
 
 
 @pytest.fixture
-def codec():
+def codec() -> Codec:
     return BVCodec()
 
 

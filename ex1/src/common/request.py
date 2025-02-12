@@ -1,13 +1,7 @@
 import struct
 import socket
 
-from src.codec import BVCodec, JSONCodec
-
-
-class RequestCode:
-    success = 100  # response code, think HTTP 200
-    push = 42  # request code, think HTTP POST
-    error = 40  # response code, think HTTP 400
+from .codec import BVCodec, JSONCodec
 
 
 def checksum(data: bytes, size: int = 2) -> int:
@@ -29,6 +23,12 @@ def checksum(data: bytes, size: int = 2) -> int:
     return sum(data) % 2 ** (size * 8)
 
 
+class RequestCode:
+    success = 100  # response code, think HTTP 200
+    push = 42  # request code, think HTTP POST
+    error = 40  # response code, think HTTP 400
+
+
 class Header:
     version: int = 0
     spec: list[str] = [("B", "version", -1)]  # [(short_type, name, default), ...]
@@ -40,14 +40,17 @@ class Header:
 
     @classmethod
     def format(cls) -> str:
+        """Compute format (for ``struct``) of header for en-/decoding."""
         return cls.byteorder + "".join([s[0] for s in cls.spec])
 
     @classmethod
     def size(cls) -> int:
+        """Compute size (in bytes) of header."""
         return struct.calcsize(cls.format())
 
     @classmethod
     def decode(cls, b: bytes) -> "Header":
+        """Decode header from bytestring."""
         # Start by checking header version
         ver = int.from_bytes(
             b[:1], "little" if cls.byteorder == "<" else "big", signed=False
@@ -59,13 +62,22 @@ class Header:
         return cls(**{name: i for (_, name, _), i in zip(cls.spec, items)})
 
     def encode(self) -> bytes:
+        """Encode header information into bytes."""
         header_data = [getattr(self, name, default) for (_, name, default) in self.spec]
         return struct.pack(self.format(), *header_data)
 
     def update_with_payload(self, payload: bytes):
+        """
+        Update header information based on payload,
+        mainly used for things like checksums and packet length.
+        """
         raise NotImplementedError()
 
     def verify_payload(self, payload: bytes):
+        """
+        Verify received payload, e.g. by checking length
+        and checksum.
+        """
         raise NotImplementedError()
 
 
@@ -101,6 +113,15 @@ class Request:
         self.request_id = request_id
 
     def serialize(self) -> bytes:
+        """
+        Encode request metadata and payload into bytes using
+        the ``Codec`` specified by ``codec_cls``.
+
+        Returns
+        -------
+        bytes
+            Encoded request.
+        """
         codec = self.codec_cls()
         payload = codec.encode(self.data)
 
@@ -114,6 +135,20 @@ class Request:
 
     @classmethod
     def parse(cls, raw: bytes) -> "Request":
+        """
+        Parse bytes into Request. Requires the full
+        byte string to have been read.
+
+        Parameters
+        ----------
+        raw : bytes
+            Bytes to process.
+
+        Returns
+        -------
+        Request
+            Parsed request.
+        """
         header = cls.header_cls.decode(raw)
         payload = raw[header.size() : header.size() + header.payload_length]
 
@@ -158,7 +193,6 @@ class Request:
                 raise RuntimeError("Socket connection broken.")
             total_sent += sent
 
-        print(f"Sent {total_sent} bytes successfully.")
         return len(encoded), total_sent
 
     @classmethod
@@ -176,13 +210,6 @@ class Request:
         -------
         Request
             Parsed request.
-
-        Raises
-        ------
-        ValueError
-            _description_
-        ValueError
-            _description_
         """
         # Receive header
         header_size = cls.header_cls.size()

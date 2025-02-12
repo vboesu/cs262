@@ -4,13 +4,13 @@ from sqlalchemy import (
     String,
     ForeignKey,
     DateTime,
-    BLOB,
+    # BLOB,
     Text,
 )
 from sqlalchemy.orm import relationship, declarative_base
 from sqlalchemy.sql import func
 
-from src.lib import TIMESTAMP_FORMAT
+from src.common import TIMESTAMP_FORMAT
 
 Base = declarative_base()
 
@@ -83,9 +83,7 @@ class Message(Base):
 
 
 class Token(Base):
-    """
-    Login token.
-    """
+    """Login token."""
 
     __tablename__ = "tokens"
 

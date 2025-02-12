@@ -2,7 +2,7 @@ import pytest
 import socket
 from unittest.mock import Mock
 
-from src.request import Request, Header, HeaderV1, RequestCode, checksum
+from src.common import Request, Header, HeaderV1, RequestCode, checksum
 
 
 @pytest.fixture
