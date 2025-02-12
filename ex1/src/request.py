@@ -30,7 +30,7 @@ def checksum(data: bytes, size: int = 2) -> int:
 
 
 class Header:
-    version: int = -1
+    version: int = 0
     spec: list[str] = [("B", "version", -1)]  # [(short_type, name, default), ...]
     byteorder: str = "<"  # "<" or ">" for little or big-endian, respectively
 
@@ -115,7 +115,7 @@ class Request:
     @classmethod
     def parse(cls, raw: bytes) -> "Request":
         header = cls.header_cls.decode(raw)
-        payload = raw[header.size() :]
+        payload = raw[header.size() : header.size() + header.payload_length]
 
         # Perform checks
         header.verify_payload(payload)
