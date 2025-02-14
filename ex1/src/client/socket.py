@@ -147,11 +147,14 @@ class ClientSocketHandler:
     def close(self):
         """Clean-up of threads and socket."""
         try:
-            self.sock.close()
+            if self.sock:
+                self.sock.close()
+
         except Exception as e:
             logging.error("%s: %s", e.__class__.__name__, str(e))
 
         if self.lthread is not None:
             self.lthread.join(timeout=1)
+
         if self.pthread is not None:
             self.pthread.join(timeout=1)

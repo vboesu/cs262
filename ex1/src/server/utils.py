@@ -122,4 +122,4 @@ def soft_commit(session: Session, on_rollback: Callable = None):
 
         # Handling
         if on_rollback:
-            on_rollback(session, e)
+            on_rollback()

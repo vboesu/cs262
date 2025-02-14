@@ -4,7 +4,7 @@ from typing import Callable
 
 from sqlalchemy.sql import func
 
-from src.common import Request, RequestCode
+from src.common import Request, RequestCode, hash_password
 from src.models import Message, Token, User
 from .socket import ServerSocketHandler, connected_clients
 from .utils import error_, op, soft_commit
@@ -83,9 +83,6 @@ def register(
     password is only received as a hash, it is up to the client to ensure that
     the password is only transmitted as a hash.
 
-    NOTE(vboesu): This is probably not a great idea, maybe we should re-hash it
-    on the server just to be sure.
-
     Parameters
     ----------
     username : str
@@ -103,8 +100,8 @@ def register(
     if not password_hash:
         raise ValueError("Missing password hash.")
 
-    # Try adding user
-    user = User(username=username, password_hash=password_hash)
+    # Try adding user, hash password again just to be sure
+    user = User(username=username, password_hash=hash_password(password_hash))
     db.session.add(user)
     soft_commit(db.session, on_rollback=lambda: error_("User already exists."))
 
@@ -148,9 +145,10 @@ def login(
     if not password_hash:
         raise ValueError("Missing password hash.")
 
+    # Hash the password again just to be sure
     user = (
         db.session.query(User)
-        .filter_by(username=username, password_hash=password_hash)
+        .filter_by(username=username, password_hash=hash_password(password_hash))
         .first()
     )
     if not user:

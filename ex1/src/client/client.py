@@ -28,7 +28,7 @@ class Client:
 
         self.socket_handler = ClientSocketHandler(self.sock, self.on_push)
 
-        # CHANGED: store messages in a dictionary keyed by message id
+        # Store messages in a dictionary keyed by message id
         # so we can unify read/unread/pushed messages and reorder them properly.
         self.messages_by_id = {}
         self.messages_per_page = 10
@@ -365,20 +365,6 @@ class Client:
         # First, extract all messages from the dict
         messages = list(self.messages_by_id.values())
 
-        # Make sure each message has a workable "timestamp" field
-        # Convert to a Python datetime if needed, or just keep the string
-        # as long as it sorts properly. If the server returns ISO8601 format,
-        # we might parse them. For simplicity assume they sort fine or parse them.
-
-        # Example parse if needed:
-        # from datetime import datetime
-        # for m in messages:
-        #     m["_dt"] = datetime.strptime(m["timestamp"], "%Y-%m-%d %H:%M:%S")
-        # ... then sort by m["_dt"]
-
-        # For demonstration, we assume the server's "timestamp" strings
-        # can be sorted lexicographically or we rely on an auto-increment `id`.
-
         # Sort by timestamp descending if newest_at_top is True
         # If your timestamps are not string-sortable, parse them or use ID
         # For demonstration, let's do ID descending as a fallback if times are the same
@@ -413,73 +399,6 @@ class Client:
         # We'll simply insert at "end"; because the list is already sorted
         # in the order we want (descending or ascending).
         self.chat_treeview.insert("", "end", values=(msg["id"], display_text))
-
-    ### EVENT HANDLERS
-    def on_push(self, request: Request):
-        """
-        Handle push notifications from the server. Typically new messages
-        from other users.
-        """
-        if "message" in request.data:
-            new_msg = request.data["message"]
-            self.update_message_store([new_msg])
-            self.refresh_chat_view()
-
-    def on_scroll(self, first, last):
-        """
-        Event handler for scroll in the messages box, used for
-        infinite scroll of previous messages.
-        """
-        try:
-            last_float = float(last)
-        except ValueError:
-            return
-
-        if last_float >= 1.0:
-            # User has scrolled to the bottom, load more messages
-            if self.has_more_messages and not self.is_loading_messages:
-                self.load_previous_messages_page()
-
-    def on_account_select(self, *args):
-        selection = self.accounts_listbox.curselection()
-        if selection:
-            index = selection[0]
-            username = self.accounts_listbox.get(index)
-            self.recipient_entry.delete(0, tk.END)
-            self.recipient_entry.insert(0, username)
-
-    def on_delete_key(self, *args):
-        """
-        Handle 'BackSpace' to delete selected messages.
-        """
-        selected_items = self.chat_treeview.selection()
-        if not selected_items:
-            return
-        confirm = messagebox.askyesno(
-            "Delete Messages",
-            f"Are you sure you want to delete the selected {len(selected_items)} message(s)?",
-        )
-        if not confirm:
-            return
-
-        message_ids = []
-        for item in selected_items:
-            mid = self.chat_treeview.item(item, "values")[0]
-            message_ids.append(int(mid))
-
-        req_data = {"messages": message_ids}
-        response = self.socket_handler.send("delete_messages", req_data).get()
-        if response.request_code == RequestCode.success:
-            # Remove them from local store
-            for mid in message_ids:
-                self.messages_by_id.pop(mid, None)
-            self.refresh_chat_view()
-            messagebox.showinfo("Success", "Selected messages have been deleted.")
-        else:
-            messagebox.showerror(
-                f"Error: {response.request_code}",
-                response.data.get("error", "Unknown error."),
-            )
 
     ### ACCOUNTS
     def search_accounts(self):
@@ -560,6 +479,73 @@ class Client:
                     f"Error: {response.request_code}",
                     response.data.get("error", "Unknown error."),
                 )
+
+    ### EVENT HANDLERS
+    def on_push(self, request: Request):
+        """
+        Handle push notifications from the server. Typically new messages
+        from other users.
+        """
+        if "message" in request.data:
+            new_msg = request.data["message"]
+            self.update_message_store([new_msg])
+            self.refresh_chat_view()
+
+    def on_scroll(self, first, last):
+        """
+        Event handler for scroll in the messages box, used for
+        infinite scroll of previous messages.
+        """
+        try:
+            last_float = float(last)
+        except ValueError:
+            return
+
+        if last_float >= 1.0:
+            # User has scrolled to the bottom, load more messages
+            if self.has_more_messages and not self.is_loading_messages:
+                self.load_previous_messages_page()
+
+    def on_account_select(self, *args):
+        selection = self.accounts_listbox.curselection()
+        if selection:
+            index = selection[0]
+            username = self.accounts_listbox.get(index)
+            self.recipient_entry.delete(0, tk.END)
+            self.recipient_entry.insert(0, username)
+
+    def on_delete_key(self, *args):
+        """
+        Handle 'BackSpace' to delete selected messages.
+        """
+        selected_items = self.chat_treeview.selection()
+        if not selected_items:
+            return
+        confirm = messagebox.askyesno(
+            "Delete Messages",
+            f"Are you sure you want to delete the selected {len(selected_items)} message(s)?",
+        )
+        if not confirm:
+            return
+
+        message_ids = []
+        for item in selected_items:
+            mid = self.chat_treeview.item(item, "values")[0]
+            message_ids.append(int(mid))
+
+        req_data = {"messages": message_ids}
+        response = self.socket_handler.send("delete_messages", req_data).get()
+        if response.request_code == RequestCode.success:
+            # Remove them from local store
+            for mid in message_ids:
+                self.messages_by_id.pop(mid, None)
+            self.refresh_chat_view()
+            messagebox.showinfo("Success", "Selected messages have been deleted.")
+        else:
+            messagebox.showerror(
+                f"Error: {response.request_code}",
+                response.data.get("error", "Unknown error."),
+            )
 
     def on_close(self):
         self.root.destroy()
