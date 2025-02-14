@@ -55,6 +55,12 @@ The separate listener thread then continuously listens for responses from the se
 
 A separate push thread blocks on the push queue and re-awakens once a push notification has been received. It then processes the push notification according to its type, which in our case is usually identified by the type of content that is sent along with it, although one may also imagine in the future different kinds of push request codes or a use of the `request_id` field as flags etc. to indicate the specific type of push notification.
 
+## Testing
+We created unit tests for the code shared by the client and the server, in particular our custom wire protocol encoder and decoder, and the request library which takes care of creating, transmitting, receiving, and parsing requests. To run the tests, run
+```
+python -m pytest tests
+```
+
 ## Usage
 To start the server, run
 ```
