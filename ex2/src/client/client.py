@@ -1,13 +1,23 @@
 import logging
 import math
-import socket
 import tkinter as tk
 from tkinter import ttk
 from tkinter import messagebox
 
-from src.common import hash_password, Request, RequestCode
+import grpc
 
-from .socket import ClientSocketHandler
+from src.common import protocol_pb2_grpc, hash_password
+from src.common.protocol_pb2 import (
+    ListAccountsRequest,
+    GenericRequest,
+    LoginRequest,
+    PaginatedRequest,
+    Header,
+    MessageRequest,
+    DeleteMessagesRequest,
+    UnreadMessagesRequest,
+)
+
 from .views import PlaceholderEntry
 
 logger = logging.getLogger(__name__)
@@ -23,10 +33,9 @@ class Client:
         # Connection
         self.host = host
         self.port = port
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.connect((host, port))
-
-        self.socket_handler = ClientSocketHandler(self.sock, self.on_push)
+        self.channel = grpc.insecure_channel(f"{host}:{port}")
+        self.stub = protocol_pb2_grpc.BVChatStub(self.channel)
+        self.header = Header(login_token=b"")
 
         # Store messages in a dictionary keyed by message id
         # so we can unify read/unread/pushed messages and reorder them properly.
@@ -48,7 +57,7 @@ class Client:
 
         # UI setup
         self.root.title("CS 262 BVC (Bright-Vincent-Chat)")
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        # TODO: self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         # Create frames
         self.login_frame = tk.Frame(self.root)
@@ -203,25 +212,25 @@ class Client:
             return
 
         pwd_hash = hash_password(password)
-        req_data = {"username": username, "password_hash": pwd_hash}
-        response = self.socket_handler.send("register", req_data).get()
 
-        if response.request_code == RequestCode.success:
-            self.token = response.data.get("token")
+        request = LoginRequest(username=username, password_hash=pwd_hash)
+        response = self.stub.Register(request)
+
+        if not response.HasField("error"):
+            self.token = response.login_token
             self.current_user = username
-            self.socket_handler.default_data["token"] = self.token
+            self.header.login_token = self.token
             self.show_chat_interface()
             self.update_unread_label()
             # Load read messages (newest first) to fill the view
             self.load_previous_messages_page()
             self.load_accounts_page(1)
         else:
-            messagebox.showerror(
-                f"Error: {response.request_code}",
-                response.data.get("error", "Unknown error."),
-            )
+            messagebox.showerror("Error", response.error.message)
 
     def login(self):
+        pass
+
         username = self.username_entry.get().strip()
         password = self.password_entry.get().strip()
         if not username or not password:
@@ -229,24 +238,22 @@ class Client:
             return
 
         pwd_hash = hash_password(password)
-        req_data = {"username": username, "password_hash": pwd_hash}
-        response = self.socket_handler.send("login", req_data).get()
 
-        if response.request_code == RequestCode.success:
-            self.token = response.data.get("token", None)
+        request = LoginRequest(username=username, password_hash=pwd_hash)
+        response = self.stub.Login(request)
+
+        if not response.HasField("error"):
+            self.token = response.login_token
+            self.unread_count = response.unread_count
             self.current_user = username
-            self.unread_count = response.data.get("unread", 0)
-            self.socket_handler.default_data["token"] = self.token
-
+            self.header.login_token = self.token
             self.show_chat_interface()
             self.update_unread_label()
+            # Load read messages (newest first) to fill the view
             self.load_previous_messages_page()
             self.load_accounts_page(1)
         else:
-            messagebox.showerror(
-                f"Error: {response.request_code}",
-                response.data.get("error", "Unknown error."),
-            )
+            messagebox.showerror("Error", response.error.message)
 
     def show_chat_interface(self):
         self.login_frame.pack_forget()
@@ -264,20 +271,19 @@ class Client:
             messagebox.showerror("Error", "Recipient and message cannot be empty.")
             return
 
-        req_data = {"to": recipient, "content": content}
-        response = self.socket_handler.send("message", req_data).get()
+        request = MessageRequest(
+            header=self.header, recipient=recipient, content=content
+        )
+        response = self.stub.SendMessage(request)
 
-        if response.request_code == RequestCode.success:
-            message = response.data.get("message")
-            assert message is not None
-            self.update_message_store([message])
+        if not response.HasField("error"):
+            assert len(response.messages)
+            self.update_message_store(response.messages)
             self.refresh_chat_view()
             self.message_entry.delete(0, tk.END)
+
         else:
-            messagebox.showerror(
-                f"Error: {response.request_code}",
-                response.data.get("error", "Unknown error."),
-            )
+            messagebox.showerror("Error", response.error.message)
 
     def load_unread(self):
         try:
@@ -298,21 +304,23 @@ class Client:
         self.is_loading_messages = True
         self.messages_page += 1
 
-        req_data = {"page": self.messages_page, "per_page": self.messages_per_page}
-        response = self.socket_handler.send("read_messages", req_data).get()
+        request = GenericRequest(
+            header=self.header,
+            pagination=PaginatedRequest(
+                page=self.messages_page, per_page=self.messages_per_page
+            ),
+        )
+        response = self.stub.GetMessages(request)
 
-        if response.request_code == RequestCode.success:
-            messages = response.data.get("items", [])
-            if messages:
-                self.update_message_store(messages)
+        if not response.HasField("error"):
+            if len(response.messages):
+                self.update_message_store(response.messages)
                 self.refresh_chat_view()
             else:
                 self.has_more_messages = False
+
         else:
-            messagebox.showerror(
-                f"Error: {response.request_code}",
-                response.data.get("error", "Unknown error."),
-            )
+            messagebox.showerror("Error", response.error.message)
 
         self.is_loading_messages = False
 
@@ -328,23 +336,19 @@ class Client:
         """
         self.is_loading_messages = True
 
-        req_data = {"per_page": count}
-        response = self.socket_handler.send("unread_messages", req_data).get()
+        request = UnreadMessagesRequest(header=self.header, count=count)
+        response = self.stub.GetUnreadMessages(request)
 
-        if response.request_code == RequestCode.success:
-            messages = response.data.get("items", [])
-            if messages:
-                self.update_message_store(messages)
+        if not response.HasField("error"):
+            if len(response.messages):
+                self.update_message_store(response.messages)
                 # unread_count goes down by however many we retrieved
-                self.unread_count = max(0, self.unread_count - len(messages))
+                self.unread_count = max(0, self.unread_count - len(response.messages))
                 self.update_unread_label()
                 self.refresh_chat_view()
 
         else:
-            messagebox.showerror(
-                f"Error: {response.request_code}",
-                response.data.get("error", "Unknown error."),
-            )
+            messagebox.showerror("Error", response.error.message)
 
         self.is_loading_messages = False
 
@@ -355,7 +359,7 @@ class Client:
         keyed by `id`. This ensures no duplicates.
         """
         for msg in incoming_messages:
-            self.messages_by_id[msg["id"]] = msg
+            self.messages_by_id[msg.id] = msg
 
     def refresh_chat_view(self):
         """
@@ -368,9 +372,7 @@ class Client:
         # Sort by timestamp descending if newest_at_top is True
         # If your timestamps are not string-sortable, parse them or use ID
         # For demonstration, let's do ID descending as a fallback if times are the same
-        messages.sort(
-            key=lambda m: (m["timestamp"], m["id"]), reverse=self.newest_at_top
-        )
+        messages.sort(key=lambda m: (m.timestamp, m.id), reverse=self.newest_at_top)
 
         # Clear the tree
         for item in self.chat_treeview.get_children():
@@ -384,21 +386,19 @@ class Client:
         """
         Renders one message in the Treeview.
         """
-        if msg["from"] == self.current_user:
-            display_text = f"You to {msg['to']} ({msg['timestamp']}): {msg['content']}"
-        elif msg["to"] == self.current_user:
-            display_text = (
-                f"{msg['from']} to you ({msg['timestamp']}): {msg['content']}"
-            )
+        if msg.sender == self.current_user:
+            display_text = f"You to {msg.recipient} ({msg.timestamp}): {msg.content}"
+        elif msg.recipient == self.current_user:
+            display_text = f"{msg.sender} to you ({msg.timestamp}): {msg.content}"
         else:
             # In the future, if there's a group chat or something else
             display_text = (
-                f"{msg['from']} to {msg['to']} ({msg['timestamp']}): {msg['content']}"
+                f"{msg.sender} to {msg.recipient} ({msg.timestamp}): {msg.content}"
             )
 
         # We'll simply insert at "end"; because the list is already sorted
         # in the order we want (descending or ascending).
-        self.chat_treeview.insert("", "end", values=(msg["id"], display_text))
+        self.chat_treeview.insert("", "end", values=(msg.id, display_text))
 
     ### ACCOUNTS
     def search_accounts(self):
@@ -413,16 +413,16 @@ class Client:
         self.load_accounts_page(1)
 
     def load_accounts_page(self, page: int):
-        req_data = {
-            "pattern": self.accounts_search,
-            "page": page,
-            "per_page": self.accounts_per_page,
-        }
-        response = self.socket_handler.send("accounts", req_data).get()
+        request = ListAccountsRequest(
+            header=self.header,
+            pattern=self.accounts_search,
+            pagination=PaginatedRequest(page=page, per_page=self.accounts_per_page),
+        )
+        response = self.stub.ListAccounts(request)
 
-        if response.request_code == RequestCode.success:
-            accounts = response.data.get("items", [])
-            total_count = response.data.get("total_count", 0)
+        if not response.HasField("error"):
+            accounts = response.accounts
+            total_count = response.pagination.total_count
             self.accounts_total_pages = (
                 math.ceil(total_count / self.accounts_per_page)
                 if self.accounts_per_page > 0
@@ -432,15 +432,12 @@ class Client:
             # Clear accounts and re-add
             self.accounts_listbox.delete(0, tk.END)
             for account in accounts:
-                self.accounts_listbox.insert(tk.END, account["username"])
+                self.accounts_listbox.insert(tk.END, account.username)
 
             # Update pagination buttons
             self.update_accounts_pagination_buttons()
         else:
-            messagebox.showerror(
-                f"Error: {response.request_code}",
-                response.data.get("error", "Unknown error."),
-            )
+            messagebox.showerror("Error", response.error.message)
 
     def update_accounts_pagination_buttons(self):
         # Disable "Previous" button if on first page
@@ -471,25 +468,23 @@ class Client:
             "Are you sure you want to delete your account? This action cannot be undone.",
         )
         if confirm:
-            response = self.socket_handler.send("delete_account").get()
-            if response.request_code == RequestCode.success:
-                self.on_close()
+            request = GenericRequest(header=self.header)
+            response = self.stub.DeleteAccount(request)
+            if response.HasField("error"):
+                messagebox.showerror("Error", response.error.message)
             else:
-                messagebox.showerror(
-                    f"Error: {response.request_code}",
-                    response.data.get("error", "Unknown error."),
-                )
+                self.on_close()
 
-    ### EVENT HANDLERS
-    def on_push(self, request: Request):
-        """
-        Handle push notifications from the server. Typically new messages
-        from other users.
-        """
-        if "message" in request.data:
-            new_msg = request.data["message"]
-            self.update_message_store([new_msg])
-            self.refresh_chat_view()
+    # ### EVENT HANDLERS
+    # def on_push(self, request: Request):
+    #     """
+    #     Handle push notifications from the server. Typically new messages
+    #     from other users.
+    #     """
+    #     if "message" in request.data:
+    #         new_msg = request.data["message"]
+    #         self.update_message_store([new_msg])
+    #         self.refresh_chat_view()
 
     def on_scroll(self, first, last):
         """
@@ -533,20 +528,18 @@ class Client:
             mid = self.chat_treeview.item(item, "values")[0]
             message_ids.append(int(mid))
 
-        req_data = {"messages": message_ids}
-        response = self.socket_handler.send("delete_messages", req_data).get()
-        if response.request_code == RequestCode.success:
+        request = DeleteMessagesRequest(header=self.header, message_ids=message_ids)
+        response = self.stub.DeleteMessages(request)
+
+        if not response.HasField("error"):
             # Remove them from local store
             for mid in message_ids:
                 self.messages_by_id.pop(mid, None)
             self.refresh_chat_view()
-            messagebox.showinfo("Success", "Selected messages have been deleted.")
+
         else:
-            messagebox.showerror(
-                f"Error: {response.request_code}",
-                response.data.get("error", "Unknown error."),
-            )
+            messagebox.showerror("Error", response.error.message)
 
     def on_close(self):
         self.root.destroy()
-        self.socket_handler.close()
+        # self.socket_handler.close()

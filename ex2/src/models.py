@@ -4,7 +4,7 @@ from sqlalchemy import (
     String,
     ForeignKey,
     DateTime,
-    # BLOB,
+    BLOB,
     Text,
 )
 from sqlalchemy.orm import relationship, declarative_base
@@ -24,7 +24,7 @@ class User(Base):
 
     id = Column(Integer, primary_key=True)
     username = Column(String(50), unique=True, nullable=False)
-    password_hash = Column(String(64), nullable=False)
+    password_hash = Column(BLOB(64), nullable=False)
 
     # Relationship to Messages
     sent = relationship(
@@ -75,8 +75,8 @@ class Message(Base):
     def to_dict(self):
         return {
             "id": self.id,
-            "from": self.from_user.username,
-            "to": self.to_user.username,
+            "sender": self.from_user.username,
+            "recipient": self.to_user.username,
             "content": self.content,
             "timestamp": self.timestamp.strftime(TIMESTAMP_FORMAT),
         }
@@ -89,7 +89,7 @@ class Token(Base):
 
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    value = Column(String(64), nullable=False)
+    value = Column(BLOB(32), nullable=False)
     timestamp = Column(DateTime, server_default=func.now(), nullable=False)
 
     user = relationship("User", back_populates="tokens")

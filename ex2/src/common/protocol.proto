@@ -1,0 +1,128 @@
+syntax = "proto3";
+
+service BVChat {
+  // List accounts (that match search pattern)
+  rpc ListAccounts(ListAccountsRequest) returns (AccountResponse);
+
+  // Login
+  rpc Login(LoginRequest) returns (LoginResponse);
+
+  // Register
+  rpc Register(LoginRequest) returns (RegisterResponse);
+
+  // Get old messages
+  rpc GetMessages(GenericRequest) returns (MessageResponse);
+
+  // Get old messages
+  rpc GetUnreadMessages(UnreadMessagesRequest) returns (MessageResponse);
+
+  // Send a message to a user
+  rpc SendMessage(MessageRequest) returns (MessageResponse);
+
+  // Delete a set of messages
+  rpc DeleteMessages(DeleteMessagesRequest) returns (GenericResponse);
+
+  // Delete own account
+  rpc DeleteAccount(GenericRequest) returns (GenericResponse);
+
+  // Listen for messages received while being online
+  rpc ListenForMessages(GenericRequest) returns (stream Message);
+}
+
+/**
+ * Requests sent to the server
+ */
+message PaginatedRequest {
+  int32 page = 1;
+  int32 per_page = 2;
+}
+
+// For transmitting login data and other stuff in the future
+message Header { bytes login_token = 1; }
+
+message GenericRequest {
+  Header header = 1;
+  optional PaginatedRequest pagination = 2;
+}
+
+message LoginRequest {
+  string username = 1;
+  bytes password_hash = 2;
+}
+
+message ListAccountsRequest {
+  Header header = 1;
+  PaginatedRequest pagination = 2;
+  optional string pattern = 3;
+}
+
+message MessageRequest {
+  Header header = 1;
+  string recipient = 2;
+  string content = 3;
+}
+
+message UnreadMessagesRequest {
+  Header header = 1;
+  int32 count = 2;
+}
+
+message DeleteMessagesRequest {
+  Header header = 1;
+  repeated int32 message_ids = 2;
+}
+
+/**
+ * Responses sent to the client
+ */
+message ErrorResponse {
+  string message = 1;
+  // int32 error_code = 2;
+}
+
+message GenericResponse { optional ErrorResponse error = 1; }
+
+message PaginatedResponse {
+  int32 page = 1;
+  int32 per_page = 2;
+  int32 total_count = 3;
+}
+
+message LoginResponse {
+  optional ErrorResponse error = 1;
+  bytes login_token = 2;
+  int32 unread_count = 3;
+}
+
+message RegisterResponse {
+  optional ErrorResponse error = 1;
+  bytes login_token = 2;
+}
+
+message AccountResponse {
+  optional ErrorResponse error = 1;
+  repeated Account accounts = 2;
+  optional PaginatedResponse pagination = 3;
+}
+
+message MessageResponse {
+  optional ErrorResponse error = 1;
+  repeated Message messages = 2;
+  optional PaginatedResponse pagination = 3;
+}
+
+/**
+ * Objects sent to the client as part of response
+ */
+message Account {
+  int32 id = 1;
+  string username = 2;
+}
+
+message Message {
+  int32 id = 1;
+  string sender = 2;
+  string recipient = 3;
+  string content = 4;
+  string timestamp = 5;
+}
