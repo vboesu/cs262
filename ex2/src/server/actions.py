@@ -4,6 +4,7 @@ from typing import Callable
 
 import grpc
 from sqlalchemy.sql import func
+import src.common.protocol_pb2 as pb
 
 from src.common import hash_password
 from src.common.protocol_pb2 import (
@@ -270,6 +271,18 @@ def read_messages(
     }
 
 
+def build_message_proto(db_message):
+    """
+    Convert a DB `Message` object into a gRPC `Message` proto.
+    """
+    return pb.Message(
+        id=db_message.id,
+        sender=db_message.from_user.username if db_message.from_user else "",
+        recipient=db_message.to_user.username if db_message.to_user else "",
+        content=db_message.content,
+        timestamp=str(db_message.timestamp)  # or format as needed
+    )
+
 @op("SendMessage", MessageResponse, {"messages": []})
 @login_required
 def send_message(
@@ -307,7 +320,9 @@ def send_message(
     )
 
     # Attempt to immediately deliver the message
-    server.notifications.put({"event": "message", "data": message})
+
+    # server.notifications.put({"event": "message", "data": message})
+    server.active_listeners[to_user.id].put(message)
 
     return {"messages": [RPCMessage(**message.to_dict())]}
 
@@ -369,4 +384,5 @@ def listen_for_messages(
     Register current user as listening for messages.
     """
     # TODO
-    pass
+    yield actions.build_message_proto(msg_obj)
+

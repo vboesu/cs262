@@ -58,6 +58,8 @@ class Client:
         # UI setup
         self.root.title("CS 262 BVC (Bright-Vincent-Chat)")
         # TODO: self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.streaming_thread = None
+        self.streaming_active = False
 
         # Create frames
         self.login_frame = tk.Frame(self.root)
@@ -220,6 +222,8 @@ class Client:
             self.token = response.login_token
             self.current_user = username
             self.header.login_token = self.token
+            #added
+            self.start_listening_for_messages()
             self.show_chat_interface()
             self.update_unread_label()
             # Load read messages (newest first) to fill the view
@@ -227,7 +231,7 @@ class Client:
             self.load_accounts_page(1)
         else:
             messagebox.showerror("Error", response.error.message)
-
+                
     def login(self):
         pass
 
@@ -247,6 +251,8 @@ class Client:
             self.unread_count = response.unread_count
             self.current_user = username
             self.header.login_token = self.token
+            #Added
+            self.start_listening_for_messages()
             self.show_chat_interface()
             self.update_unread_label()
             # Load read messages (newest first) to fill the view
@@ -254,6 +260,46 @@ class Client:
             self.load_accounts_page(1)
         else:
             messagebox.showerror("Error", response.error.message)
+
+#ADDED Helpers
+    def start_listening_for_messages(self):
+        """
+        Spawns a background thread that calls the streaming RPC
+        ListenForMessages, receiving messages in real-time.
+        """
+        if self.streaming_active:
+            return
+        self.streaming_active = True
+
+        def stream_loop():
+            try:
+                for msg in self.stub.ListenForMessages(GenericRequest(header=self.header)):
+                    # `msg` is of type protocol_pb2.Message
+                    self.handle_incoming_message(msg)
+            except grpc.RpcError as e:
+                logger.error(f"ListenForMessages ended: {e}")
+            finally:
+                self.streaming_active = False
+
+        self.streaming_thread = threading.Thread(target=stream_loop, daemon=True)
+        self.streaming_thread.start()
+
+    def handle_incoming_message(self, msg):
+        """
+        Take the newly arrived message (type = Message), store it,
+        and refresh the UI on the main thread.
+        """
+        # Convert to the same form as the other messages we have in local store
+        # or you can store it directly. We just need to keep it consistent with
+        # how 'self.messages_by_id' is used.
+        # We can do a mini 'to_dict':
+        fake_id = msg.id
+        # Create a synthetic object or protocol buffer "Message" for storage:
+        # or just store it in your dictionary as is
+        self.messages_by_id[fake_id] = msg
+
+        # Because Tkinter is single-threaded, schedule UI updates via .after():
+        self.root.after(0, self.refresh_chat_view)
 
     def show_chat_interface(self):
         self.login_frame.pack_forget()
