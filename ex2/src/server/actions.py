@@ -1,13 +1,13 @@
 from datetime import datetime
+import queue
 import secrets
 from typing import Callable
 
 import grpc
 from sqlalchemy.sql import func
-import src.common.protocol_pb2 as pb
 
-from src.common import hash_password
-from src.common.protocol_pb2 import (
+from src.common import (
+    hash_password,
     Account,
     AccountResponse,
     GenericResponse,
@@ -25,7 +25,7 @@ from src.common.protocol_pb2 import (
 )
 
 from src.models import Message, Token, User
-from .utils import error_, op, soft_commit
+from .utils import error_, op, soft_commit, EmptyGenerator
 from . import db
 
 
@@ -156,6 +156,8 @@ def list_accounts(
     List all accounts, optionally matching some provided ``pattern`` which
     may use SQL-style wildcard search for fuzzy matches.
     """
+    print("test")
+
     if request.pattern not in ["", "*"]:
         # case-insensitive search
         query = db.session.query(User).where(User.username.ilike(request.pattern))
@@ -271,18 +273,6 @@ def read_messages(
     }
 
 
-def build_message_proto(db_message):
-    """
-    Convert a DB `Message` object into a gRPC `Message` proto.
-    """
-    return pb.Message(
-        id=db_message.id,
-        sender=db_message.from_user.username if db_message.from_user else "",
-        recipient=db_message.to_user.username if db_message.to_user else "",
-        content=db_message.content,
-        timestamp=str(db_message.timestamp)  # or format as needed
-    )
-
 @op("SendMessage", MessageResponse, {"messages": []})
 @login_required
 def send_message(
@@ -320,9 +310,10 @@ def send_message(
     )
 
     # Attempt to immediately deliver the message
+    server.notifications[to_user.id].put({"event": "message", "data": message})
 
-    # server.notifications.put({"event": "message", "data": message})
-    server.active_listeners[to_user.id].put(message)
+    # # server.notifications.put()
+    # server.active_listeners[to_user.id].put(message)
 
     return {"messages": [RPCMessage(**message.to_dict())]}
 
@@ -370,7 +361,7 @@ def delete_account(
     soft_commit(db.session)
 
 
-@op("ListenForMessages", GenericResponse, {})
+@op("ListenForMessages", EmptyGenerator, {})
 @login_required
 def listen_for_messages(
     server,
@@ -383,6 +374,19 @@ def listen_for_messages(
     """
     Register current user as listening for messages.
     """
-    # TODO
-    yield actions.build_message_proto(msg_obj)
+    print("RECEIVED LISTENING REQUEST FROM " + current_user.username)
+    server.notifications[current_user.id] = queue.Queue()  # TODO: thread safety
 
+    # TODO: this blocks the thread so there is a limit to how many clients we
+    # can have connected at the same time. not ideal.
+
+    while True:
+        notification = server.notifications[current_user.id].get()
+        assert notification["event"] == "message"  # for now
+
+        # mark message as read
+        message = notification["data"]
+        message.read_at = datetime.now()
+        soft_commit(db.session)
+
+        yield RPCMessage(**message.to_dict())

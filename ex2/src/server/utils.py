@@ -1,4 +1,5 @@
 import logging
+import types
 from typing import Callable
 from copy import deepcopy
 
@@ -55,6 +56,9 @@ def route(
 
             elif isinstance(result, dict):
                 return response_cls(**{**response_defaults, **result})
+
+            elif isinstance(result, types.GeneratorType):
+                return result
 
             return response_cls(**response_defaults)
 
@@ -141,3 +145,11 @@ def soft_commit(session: Session, on_rollback: Callable = None):
         # Handling
         if on_rollback:
             on_rollback()
+
+
+class EmptyGenerator(object):
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        raise StopIteration

@@ -2,7 +2,24 @@
 
 import hashlib
 
-from .protocol_pb2 import LoginRequest, LoginResponse, RegisterResponse
+from .protocol_pb2 import (
+    Account,
+    AccountResponse,
+    DeleteMessagesRequest,
+    GenericRequest,
+    GenericResponse,
+    Header,
+    ListAccountsRequest,
+    LoginRequest,
+    LoginResponse,
+    Message,
+    MessageRequest,
+    MessageResponse,
+    PaginatedRequest,
+    PaginatedResponse,
+    RegisterResponse,
+    UnreadMessagesRequest,
+)
 
 
 def hash_password(password: str | bytes) -> bytes:
@@ -17,9 +34,25 @@ def hash_password(password: str | bytes) -> bytes:
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 __all__ = [
+    "Account",
+    "AccountResponse",
+    "DeleteMessagesRequest",
+    "GenericRequest",
+    "GenericResponse",
     "hash_password",
-    "TIMESTAMP_FORMAT",
+    "Header",
+    "ListAccountsRequest",
+    "LoginRequest",
     "LoginRequest",
     "LoginResponse",
+    "LoginResponse",
+    "Message",
+    "MessageRequest",
+    "MessageResponse",
+    "PaginatedRequest",
+    "PaginatedResponse",
     "RegisterResponse",
+    "RegisterResponse",
+    "TIMESTAMP_FORMAT",
+    "UnreadMessagesRequest",
 ]

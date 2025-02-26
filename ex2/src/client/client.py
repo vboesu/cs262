@@ -1,13 +1,15 @@
 import logging
 import math
+import threading
 import tkinter as tk
 from tkinter import ttk
 from tkinter import messagebox
 
 import grpc
 
-from src.common import protocol_pb2_grpc, hash_password
-from src.common.protocol_pb2 import (
+from src.common import (
+    protocol_pb2_grpc,
+    hash_password,
     ListAccountsRequest,
     GenericRequest,
     LoginRequest,
@@ -222,7 +224,7 @@ class Client:
             self.token = response.login_token
             self.current_user = username
             self.header.login_token = self.token
-            #added
+            # added
             self.start_listening_for_messages()
             self.show_chat_interface()
             self.update_unread_label()
@@ -231,7 +233,7 @@ class Client:
             self.load_accounts_page(1)
         else:
             messagebox.showerror("Error", response.error.message)
-                
+
     def login(self):
         pass
 
@@ -251,7 +253,6 @@ class Client:
             self.unread_count = response.unread_count
             self.current_user = username
             self.header.login_token = self.token
-            #Added
             self.start_listening_for_messages()
             self.show_chat_interface()
             self.update_unread_label()
@@ -261,7 +262,6 @@ class Client:
         else:
             messagebox.showerror("Error", response.error.message)
 
-#ADDED Helpers
     def start_listening_for_messages(self):
         """
         Spawns a background thread that calls the streaming RPC
@@ -269,37 +269,44 @@ class Client:
         """
         if self.streaming_active:
             return
+
         self.streaming_active = True
 
-        def stream_loop():
+        def listen(self):
+            print("STARTING TO LISTEN")
             try:
-                for msg in self.stub.ListenForMessages(GenericRequest(header=self.header)):
-                    # `msg` is of type protocol_pb2.Message
-                    self.handle_incoming_message(msg)
+                request = GenericRequest(header=self.header)
+                for message in self.stub.ListenForMessages(request):
+                    print("RECEIVED MESSAGE", message)
+                    self.update_message_store([message])
+                    self.refresh_chat_view()
+
             except grpc.RpcError as e:
                 logger.error(f"ListenForMessages ended: {e}")
             finally:
                 self.streaming_active = False
 
-        self.streaming_thread = threading.Thread(target=stream_loop, daemon=True)
+        self.streaming_thread = threading.Thread(
+            target=listen, args=(self,), daemon=True
+        )
         self.streaming_thread.start()
 
-    def handle_incoming_message(self, msg):
-        """
-        Take the newly arrived message (type = Message), store it,
-        and refresh the UI on the main thread.
-        """
-        # Convert to the same form as the other messages we have in local store
-        # or you can store it directly. We just need to keep it consistent with
-        # how 'self.messages_by_id' is used.
-        # We can do a mini 'to_dict':
-        fake_id = msg.id
-        # Create a synthetic object or protocol buffer "Message" for storage:
-        # or just store it in your dictionary as is
-        self.messages_by_id[fake_id] = msg
+    # def handle_incoming_message(self, msg):
+    #     """
+    #     Take the newly arrived message (type = Message), store it,
+    #     and refresh the UI on the main thread.
+    #     """
+    #     # Convert to the same form as the other messages we have in local store
+    #     # or you can store it directly. We just need to keep it consistent with
+    #     # how 'self.messages_by_id' is used.
+    #     # We can do a mini 'to_dict':
+    #     fake_id = msg.id
+    #     # Create a synthetic object or protocol buffer "Message" for storage:
+    #     # or just store it in your dictionary as is
+    #     self.messages_by_id[fake_id] = msg
 
-        # Because Tkinter is single-threaded, schedule UI updates via .after():
-        self.root.after(0, self.refresh_chat_view)
+    #     # Because Tkinter is single-threaded, schedule UI updates via .after():
+    #     self.root.after(0, self.refresh_chat_view)
 
     def show_chat_interface(self):
         self.login_frame.pack_forget()
