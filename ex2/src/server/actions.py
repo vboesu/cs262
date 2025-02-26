@@ -156,8 +156,6 @@ def list_accounts(
     List all accounts, optionally matching some provided ``pattern`` which
     may use SQL-style wildcard search for fuzzy matches.
     """
-    print("test")
-
     if request.pattern not in ["", "*"]:
         # case-insensitive search
         query = db.session.query(User).where(User.username.ilike(request.pattern))
