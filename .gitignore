@@ -143,6 +143,9 @@ venv.bak/
 # Thumbnails
 Thumbs.db
 
+# Databases
+*.db
+
 # Other files
 *.swp
 *.swo
