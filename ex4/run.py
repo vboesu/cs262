@@ -113,7 +113,7 @@ def start_server(id: int, config: str, verbose: int):
 
     server = Server(
         id,
-        machine["host"],
+        "0.0.0.0",
         machine["port"],
         machine["internal_port"],
         machine["db_url"],
