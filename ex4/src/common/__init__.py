@@ -32,7 +32,10 @@ OP_TO_CODE = {
     "internal_election": 66,
     "internal_election_ok": 67,
     "internal_leader_announce": 68,
-    "internal_acknowledge": 69,
+    "internal_ok": 69,
+    "internal_fail": 70,
+    "internal_request_log": 71,
+    "internal_forward_request": 72,
 }
 
 CODE_TO_OP = {c: o for o, c in OP_TO_CODE.items()}

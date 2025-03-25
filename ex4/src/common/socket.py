@@ -202,6 +202,7 @@ class SocketHandler:
                 )
             sent_to = (remote_host, remote_port)
             sock.close()
+            break
 
         if sent_to is None:
             raise ConnectionRefusedError(
@@ -212,6 +213,30 @@ class SocketHandler:
             return sent_to, response_queue
 
         return sent_to, None
+
+    def respond_to(
+        self,
+        request: Request,
+        response_code: int,
+        response_data: dict | None = None,
+    ) -> None:
+        # Get response address from request
+        response_host, _ = request.addr
+        response_port = request.data.get("response_port", request.addr[1])
+
+        logger.info(f"Attempting to respond to {response_host}:{response_port}.")
+
+        try:
+            self.send(
+                [(response_host, response_port)],
+                request_code=response_code,
+                request_id=request.request_id,
+                data=response_data,
+                await_response=False,
+            )
+
+        except ConnectionRefusedError:
+            logger.info(f"Unable to respond to {response_host}:{response_port}.")
 
     def close(self):
         """Clean-up of threads and socket."""

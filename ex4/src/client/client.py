@@ -18,7 +18,6 @@ class Client:
 
     def __init__(self, local_host: str, remote_hosts: list[tuple[str, int]]):
         self.root = tk.Tk()
-        self.token = None
         self.current_user = None
         self.unread_count = 0
 
@@ -229,9 +228,9 @@ class Client:
             response = self.send("register", req_data).get()
 
             if response.request_code == RequestCode.success:
-                self.token = response.data.get("token")
                 self.current_user = username
-                self.sh.default_data["token"] = self.token
+                self.sh.default_data["username"] = username
+                self.sh.default_data["password_hash"] = pwd_hash
                 self.show_chat_interface()
                 self.update_unread_label()
                 # Load read messages (newest first) to fill the view
@@ -260,10 +259,10 @@ class Client:
             response = self.send("login", req_data).get()
 
             if response.request_code == RequestCode.success:
-                self.token = response.data.get("token", None)
                 self.current_user = username
                 self.unread_count = response.data.get("unread", 0)
-                self.sh.default_data["token"] = self.token
+                self.sh.default_data["username"] = username
+                self.sh.default_data["password_hash"] = pwd_hash
 
                 self.show_chat_interface()
                 self.update_unread_label()

@@ -1,11 +1,10 @@
 from datetime import datetime
-import secrets
 from typing import Callable
 
 from sqlalchemy.sql import func
 
-from src.common import Request, RequestCode, hash_password
-from src.models import Message, Token, User
+from src.common import hash_password
+from src.models import Message, User
 
 # from .socket import ServerSocketHandler, connected_clients
 from .utils import error_, op, soft_commit
@@ -14,24 +13,23 @@ from . import db
 
 def login_required(func: Callable) -> Callable:
     """
-    Decorator function to require a valid login token for access.
+    Decorator function to require valid login data for access.
 
-    This decorator queries the database for a matching token and validates
-    that it has not expired before passing the request onto the handler.
+    This decorator queries the database for the reqested user and validates
+    that the password hashes match before passing the request onto the handler.
 
     Parameters
     ----------
     func : callable
         The function to decorate. This function must accept keyword arguments,
-        as the token is passed via ``**kwargs``. The decorated function will
-        receive an additional keyword argument ``current_user`` of type ``User``
-        representing the validated user.
+        as the authentication data is passed via ``**kwargs``. The decorated
+        function will receive an additional keyword argument ``current_user``
+        of type ``User`` representing the validated user.
 
     Raises
     ------
     ValueError
-        If the token is not provided, does not match any stored token, or has
-        expired.
+        If the authentication is unsuccessful.
 
     Examples
     --------
@@ -41,14 +39,23 @@ def login_required(func: Callable) -> Callable:
     """
 
     def decorator(*args, **kwargs):
-        token = kwargs.get("token", b"")
+        username = kwargs.get("username", "")
+        password_hash = kwargs.get("password_hash", b"")
 
-        login_token = db.session.query(Token).filter_by(value=token).first()
-        if not login_token:
-            # TODO(vboesu): make tokens expire after a while
-            raise ValueError("Unauthorized.")
+        if not username:
+            raise ValueError("Missing username.")
+        if not password_hash:
+            raise ValueError("Missing password hash.")
 
-        return func(*args, current_user=login_token.user, **kwargs)
+        user = (
+            db.session.query(User)
+            .filter_by(username=username, password_hash=hash_password(password_hash))
+            .first()
+        )
+        if not user:
+            raise ValueError("Invalid login credentials.")
+
+        return func(*args, current_user=user, **kwargs)
 
     return decorator
 
@@ -89,11 +96,6 @@ def register(
         Username of the user attempting to log in.
     password_hash : bytes
         Password hash of the user.
-
-    Returns
-    -------
-    dict[str]
-        "token": Login token, to be used in subsequent server calls for identification.
     """
     if not username:
         raise ValueError("Missing username.")
@@ -105,67 +107,30 @@ def register(
     db.session.add(user)
     soft_commit(db.session, on_rollback=lambda: error_("User already exists."))
 
-    # Generate login token
-    # connected_clients[username] = connection
-    token = Token(user_id=user.id, value=secrets.token_hex(32))
-    db.session.add(token)
-    soft_commit(
-        db.session, on_rollback=lambda: error_("Unable to generate login token.")
-    )
-
-    return {"token": token.value}
+    return
 
 
 @op("login")
+@login_required
 def login(
-    username: str,
-    password_hash: bytes,
+    current_user: User,
     *args,
     **kwargs,
 ):
     """
-    Attempts to log in a user based on the provided username and password_hash.
-
-    Parameters
-    ----------
-    username : str
-        Username of the user attempting to log in.
-    password_hash : bytes
-        Password hash of the user.
+    Attempts to log in user, returns number of undelivered messages.
 
     Returns
     -------
     dict[str]
         "unread": Number of undelivered and unread messages.
-        "token": Login token, to be used in subsequent server calls for identification.
     """
-    if not username:
-        raise ValueError("Missing username.")
-    if not password_hash:
-        raise ValueError("Missing password hash.")
-
-    # Hash the password again just to be sure
-    user = (
-        db.session.query(User)
-        .filter_by(username=username, password_hash=hash_password(password_hash))
-        .first()
-    )
-    if not user:
-        raise ValueError("Invalid login credentials.")
-
-    # Generate login token
-    token = Token(user_id=user.id, value=secrets.token_hex(32))
-    db.session.add(token)
-    soft_commit(
-        db.session, on_rollback=lambda: error_("Unable to generate login token.")
-    )
-
     # Get number of unread messages
     unread_query = db.session.query(func.count(Message.id)).filter_by(
-        to_id=user.id, read_at=None
+        to_id=current_user.id, read_at=None
     )
 
-    return {"unread": db.session.execute(unread_query).scalar(), "token": token.value}
+    return {"unread": db.session.execute(unread_query).scalar()}
 
 
 @op("accounts")

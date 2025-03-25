@@ -4,7 +4,7 @@ from sqlalchemy import (
     String,
     ForeignKey,
     DateTime,
-    # BLOB,
+    BLOB,
     Text,
 )
 from sqlalchemy.orm import relationship, declarative_base
@@ -40,11 +40,8 @@ class User(Base):
         cascade="all, delete-orphan",
     )
 
-    # Relationship to Tokens
-    tokens = relationship("Token", back_populates="user", cascade="all, delete-orphan")
-
     def __repr__(self):
-        return f"<User(id={self.id}, username='{self.username}')>"
+        return f"<User id={self.id} username='{self.username}'>"
 
     def to_dict(self):
         return {"id": self.id, "username": self.username}
@@ -70,7 +67,7 @@ class Message(Base):
     to_user = relationship("User", back_populates="received", foreign_keys=[to_id])
 
     def __repr__(self):
-        return f"<Message(id={self.id}, from_id={self.from_id}, to_id={self.to_id}, timestamp={self.timestamp})>"
+        return f"<Message id={self.id} from_id={self.from_id} to_id={self.to_id}, timestamp='{self.timestamp}'>"
 
     def to_dict(self):
         return {
@@ -82,19 +79,16 @@ class Message(Base):
         }
 
 
-class Token(Base):
-    """Login token."""
+class Log(Base):
+    """
+    Log model representing a log entry for a server replica.
+    """
 
-    __tablename__ = "tokens"
+    __tablename__ = "logs"
 
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    value = Column(String(64), nullable=False)
-    timestamp = Column(DateTime, server_default=func.now(), nullable=False)
+    clock = Column(Integer, nullable=False)
+    request = Column(BLOB, nullable=False)
 
-    user = relationship("User", back_populates="tokens")
-
-    def __repr__(self):
-        return (
-            f"<Token(id={self.id}, user_id={self.user_id}, timestamp={self.timestamp})>"
-        )
+    def __repr__(self) -> str:
+        return f"<Log id={self.id} clock={self.clock} request='{self.request[:128]}'>"
