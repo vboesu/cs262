@@ -224,10 +224,11 @@ class TestRequest:
         mock_sock = Mock(spec=socket.socket)
         mock_sock.recv.side_effect = side_effect_sequence
 
-        received_req = Request.receive(mock_sock)
+        received_req = Request.receive(mock_sock, "test_addr:1234")
         assert received_req.request_code == RequestCode.push
         assert received_req.request_id == 202
         assert received_req.data == sample_data
+        assert received_req.addr == "test_addr:1234"
 
         # Confirm recv was called multiple times
         assert mock_sock.recv.call_count == 4
@@ -241,7 +242,7 @@ class TestRequest:
         mock_sock.recv.return_value = b""
 
         with pytest.raises(ValueError):
-            Request.receive(mock_sock)
+            Request.receive(mock_sock, "")
 
     def test_request_receive_payload_failure(self):
         """
@@ -260,4 +261,4 @@ class TestRequest:
         mock_sock.recv.side_effect = [header_part, payload_part]
 
         with pytest.raises(ValueError):
-            Request.receive(mock_sock)
+            Request.receive(mock_sock, "")
