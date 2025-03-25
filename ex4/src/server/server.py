@@ -1,4 +1,3 @@
-from collections import OrderedDict
 import logging
 import socket
 import time
@@ -77,7 +76,7 @@ class Server:
                     f"Server has not implemented operation code {request.request_code}."
                 )
 
-            ret = routing_registry[request.request_code](**request.data)
+            ret = routing_registry[request.request_code](self, **request.data)
             response = (RequestCode.success, ret, request.request_id)
             logger.debug(f"Processed {request}, received response {response}.")
 
@@ -108,7 +107,7 @@ class Server:
                         request_code=OP_TO_CODE["internal_log"],
                         data={"request": request_bytes, "clock": cclock},
                     )
-                    queues.append(q)
+                    queues.append((peer_id, q))
                     n_reached += 1
                     logger.debug(f"Successfully broadcast to peer {peer_id}.")
 
@@ -117,7 +116,7 @@ class Server:
                     continue
 
             # Wait for acknowledgements
-            for q in queues:
+            for replica_id, q in queues:
                 try:
                     logger.debug(f"Waiting for {q}.")
                     res = q.get(timeout=5)
@@ -133,8 +132,12 @@ class Server:
                         # don't count it in the consensus process
                         n_reached -= 1
 
-                        next_log = res.data.get("next")
-                        # TODO: start pushing updates to this replica
+                        # Bring this replica up to date
+                        _ = threading.Thread(
+                            target=self.teach_replica,
+                            args=(replica_id, res.data.get("next")),
+                            daemon=True,
+                        ).start()
 
                 except queue.Empty:
                     continue
@@ -142,7 +145,7 @@ class Server:
             logger.debug("Received all expected responses.")
 
             # Tally, raise error if no unanimous consent
-            if len(responses) < len(queues):
+            if len(responses) < n_reached:
                 raise RuntimeError("Unable to process request. Please try again later.")
 
         except Exception as e:
@@ -420,3 +423,36 @@ class Server:
         self.push_to_leader(
             OP_TO_CODE["internal_forward_request"], {"request": request_bytes}
         )
+
+    def teach_replica(self, replica_id: int, next_log: int):
+        if next_log < 0:
+            return
+
+        logger.debug(f"Bringing replica {replica_id} up to date with {next_log}.")
+
+        with self.clock_lock:
+            if next_log > self.clock:
+                return
+
+        log_entry = self.get_log(next_log)
+        if not log_entry:
+            # skip to next, even though this should never happen
+            logger.error(f"Did not find log entry {next_log}. This should not happen!")
+            self.teach_replica(replica_id, next_log + 1)
+
+        # send log entry to replica
+        target = (
+            self.replicas[replica_id]["host"],
+            self.replicas[replica_id]["internal_port"],
+        )
+        sent_to, q = self.internal_sh.send(
+            [target],
+            request_code=OP_TO_CODE["internal_log"],
+            data={"request": log_entry.request, "clock": log_entry.clock},
+        )
+
+        # wait for response
+        res = q.get(timeout=5)
+        if res.request_code == OP_TO_CODE["internal_ok"]:
+            # continue with the next one
+            self.teach_replica(replica_id, next_log + 1)
