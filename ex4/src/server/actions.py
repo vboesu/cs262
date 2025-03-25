@@ -3,7 +3,7 @@ from typing import Callable
 
 from sqlalchemy.sql import func
 
-from src.common import hash_password
+from src.common import hash_password, RequestCode
 from src.models import Message, User
 
 # from .socket import ServerSocketHandler, connected_clients
@@ -310,19 +310,21 @@ def send_message(server, current_user: User, to: str, content: str, *args, **kwa
         on_rollback=lambda: error_("Unable to send message. Try again later."),
     )
 
-    # # If recipient is logged in, attempt to immediately deliver the message
-    # if to in connected_clients:
-    #     try:
-    #         req_data = {"message": message.to_dict()}
-    #         connected_clients[to].write(Request(RequestCode.push, req_data))
+    # If recipient is logged in, attempt to immediately deliver the message
+    # but only if we are the leader (TODO: this seems like an awful hack to put here...)
+    with server.election_lock:
+        if server.is_leader and to in server.connections_map:
+            try:
+                sent_to, _ = server.sh.send(
+                    [server.connections_map[to]],
+                    request_code=RequestCode.push,
+                    request_id=0,
+                    data={"message": message.to_dict()},
+                    await_response=False,
+                )
 
-    #         # mark message as read
-    #         message.read_at = datetime.now()
-    #         soft_commit(db.session)
-
-    #     except Exception:
-    #         # Client is no longer connected
-    #         del connected_clients[to]
+            except ConnectionRefusedError:
+                del server.connections_map[to]
 
     return {"message": message.to_dict()}
 
@@ -348,6 +350,26 @@ def delete_messages(server, current_user: User, messages: list[int], *args, **kw
 
         db.session.delete(message)
 
+    soft_commit(db.session)
+
+
+@op("mark_as_read")
+@login_required
+def mark_as_read(server, current_user: User, id: int, *args, **kwargs):
+    """
+    Mark a message as read.
+
+    Parameters
+    ----------
+    id : int
+        ID of message to mark as read.
+    """
+    message = db.session.query(Message).filter_by(id=id).first()
+    if not message or current_user.id not in [message.from_id, message.to_id]:
+        db.session.rollback()
+        raise ValueError("Invalid message IDs.")
+
+    message.read_at = datetime.now()
     soft_commit(db.session)
 
 

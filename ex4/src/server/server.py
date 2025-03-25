@@ -52,6 +52,7 @@ class Server:
         self.internal_sock: socket.socket = None
         self.sh: SocketHandler = None
         self.internal_sh: SocketHandler = None
+        self.connections_map = dict()
 
         # Set up database
         db.session = db.create_session(self.db_url, self.verbose > 0)
@@ -83,6 +84,13 @@ class Server:
             with self.election_lock:
                 if not self.is_leader:
                     return response
+
+            # Store response connection for future use
+            if "username" in request.data:
+                self.connections_map[request.data["username"]] = (
+                    request.addr[0],
+                    request.data.get("response_port", request.addr[1]),
+                )
 
             # On success: broadcast to replicas. Keep track of every replica that
             # we were able to reach, and wait for their response acknowledging

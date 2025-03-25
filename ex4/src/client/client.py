@@ -545,6 +545,9 @@ class Client:
             self.update_message_store([new_msg])
             self.refresh_chat_view()
 
+            # HACK: Tell server to mark this message as read
+            self.send("mark_as_read", {"id": new_msg["id"]})
+
     def on_scroll(self, first, last):
         """
         Event handler for scroll in the messages box, used for

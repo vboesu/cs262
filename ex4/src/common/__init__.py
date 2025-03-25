@@ -27,6 +27,7 @@ OP_TO_CODE = {
     "message": 7,
     "delete_messages": 8,
     "delete_account": 9,
+    "mark_as_read": 10,
     "internal_heartbeat": 64,
     "internal_log": 65,
     "internal_election": 66,
