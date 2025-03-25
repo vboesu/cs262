@@ -61,7 +61,7 @@ def login_required(func: Callable) -> Callable:
 
 
 @op("username_exists")
-def username_exists(username: str, *args, **kwargs):
+def username_exists(server, username: str, *args, **kwargs):
     """
     Checks if an account with the specified username exists.
     """
@@ -79,12 +79,7 @@ def username_exists(username: str, *args, **kwargs):
 
 
 @op("register")
-def register(
-    username: str,
-    password_hash: bytes,
-    *args,
-    **kwargs,
-):
+def register(server, username: str, password_hash: bytes, *args, **kwargs):
     """
     Creates a new account with the specified username and password_hash. Since the
     password is only received as a hash, it is up to the client to ensure that
@@ -112,11 +107,7 @@ def register(
 
 @op("login")
 @login_required
-def login(
-    current_user: User,
-    *args,
-    **kwargs,
-):
+def login(server, current_user: User, *args, **kwargs):
     """
     Attempts to log in user, returns number of undelivered messages.
 
@@ -136,11 +127,7 @@ def login(
 @op("accounts")
 @login_required
 def list_accounts(
-    *args,
-    pattern: str = None,
-    page: int = 1,
-    per_page: int = 20,
-    **kwargs,
+    server, *args, pattern: str = None, page: int = 1, per_page: int = 20, **kwargs
 ):
     """
     List all accounts, optionally matching some provided ``pattern`` which
@@ -188,12 +175,7 @@ def list_accounts(
 
 @op("unread_messages")
 @login_required
-def unread_messages(
-    current_user: User,
-    *args,
-    per_page: int = 20,
-    **kwargs,
-):
+def unread_messages(server, current_user: User, *args, per_page: int = 20, **kwargs):
     """
     Retrieve up to ``per_page`` unread messages for the current user, oldest first.
 
@@ -243,11 +225,7 @@ def unread_messages(
 @op("read_messages")
 @login_required
 def read_messages(
-    current_user: User,
-    *args,
-    page: int = 1,
-    per_page: int = 20,
-    **kwargs,
+    server, current_user: User, *args, page: int = 1, per_page: int = 20, **kwargs
 ):
     """
     Get previously read messages for the current user, newest first.
@@ -271,8 +249,8 @@ def read_messages(
     query = (
         db.session.query(Message)
         .filter(
-            ((Message.to_id == current_user.id) | (Message.from_id == current_user.id))
-            & (Message.read_at.is_not(None))
+            ((Message.to_id == current_user.id) & (Message.read_at.is_not(None)))
+            | (Message.from_id == current_user.id)
         )
         .order_by(Message.timestamp.desc())
     )
@@ -295,13 +273,7 @@ def read_messages(
 
 @op("message")
 @login_required
-def send_message(
-    current_user: User,
-    to: str,
-    content: str,
-    *args,
-    **kwargs,
-):
+def send_message(server, current_user: User, to: str, content: str, *args, **kwargs):
     """
     Send a message to another user, identified by their username. If the recipient
     is online, deliver the message immediately.
@@ -357,12 +329,7 @@ def send_message(
 
 @op("delete_messages")
 @login_required
-def delete_messages(
-    current_user: User,
-    messages: list[int],
-    *args,
-    **kwargs,
-):
+def delete_messages(server, current_user: User, messages: list[int], *args, **kwargs):
     """
     Delete a set of messages. All messages must be valid messages which include
     either as sender or recipient the current user, otherwise the call fails
@@ -386,7 +353,7 @@ def delete_messages(
 
 @op("delete_account")
 @login_required
-def delete_account(current_user: User, *args, **kwargs):
+def delete_account(server, current_user: User, *args, **kwargs):
     """
     Delete account of current user.
     """
