@@ -199,7 +199,7 @@ class Client:
 
     ### HELPER FUNCTIONS
     def send(
-        self, operation: str, data: dict, await_response: bool = True
+        self, operation: str, data: dict | None = None, await_response: bool = True
     ) -> queue.Queue | None:
         sent_to, response = self.sh.send(
             self.remote_hosts,
