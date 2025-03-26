@@ -45,6 +45,7 @@ class SocketHandler:
         # Initialize locks
         self.req_id_lock = threading.Lock()
         self.pending_lock = threading.Lock()
+        self.thread_lock = threading.RLock()
 
         # Initialize queues
         self.pending: dict[int, queue.Queue] = {}
@@ -54,8 +55,9 @@ class SocketHandler:
         self.receive_callback = receive_callback
 
         # Start processing
-        self.pthread = threading.Thread(target=self.process, daemon=True)
-        self.pthread.start()
+        with self.thread_lock:
+            self.pthread = threading.Thread(target=self.process, daemon=True)
+            self.pthread.start()
 
     def start_listening(self, block: bool = False):
         # Start listening
@@ -106,15 +108,19 @@ class SocketHandler:
             except Exception as e:
                 logger.error("%s: %s", e.__class__.__name__, str(e))
 
-        # NOTE(vboesu): this modification is definitely not thread-safe
-        self.lthread = None  # basically: remove self after finishing
-        self.close()
+        with self.thread_lock:
+            self.lthread = None  # basically: remove self after finishing
 
     def process(self):
         """Process the queue of new requests."""
-        while True:
-            req = self.receive_queue.get()  # blocks
-            self.receive_callback(req)
+        while not self.stop_event.is_set():
+            try:
+                # blocks, releases every 2 seconds
+                req = self.receive_queue.get(timeout=2)
+                self.receive_callback(req)
+
+            except queue.Empty:
+                pass
 
     def send(
         self,
@@ -249,8 +255,9 @@ class SocketHandler:
         except Exception as e:
             logger.error("%s: %s", e.__class__.__name__, str(e))
 
-        if self.lthread is not None:
-            self.lthread.join(timeout=1)
+        with self.thread_lock:
+            if self.lthread is not None:
+                self.lthread.join(timeout=5)
 
-        if self.pthread is not None:
-            self.pthread.join(timeout=1)
+            if self.pthread is not None:
+                self.pthread.join(timeout=5)
