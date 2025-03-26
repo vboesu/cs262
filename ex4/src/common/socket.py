@@ -60,7 +60,14 @@ class SocketHandler:
             self.pthread.start()
 
     def start_listening(self, block: bool = False):
-        # Start listening
+        """
+        Start listening for incoming requests on the socket.
+
+        Parameters
+        ----------
+        block : bool, optional
+            Should listening block or not, by default False
+        """
         if block:
             # Listen on main thread
             self.listen()
@@ -230,6 +237,19 @@ class SocketHandler:
         response_code: int,
         response_data: dict | None = None,
     ) -> None:
+        """
+        Respond to a request by returning the response to the sending
+        host and the specified `response_port`.
+
+        Parameters
+        ----------
+        request : Request
+            Original request to respond to.
+        response_code : int
+            Response code.
+        response_data : dict | None, optional
+            Response data, by default None
+        """
         # Get response address from request
         response_host, _ = request.addr
         response_port = request.data.get("response_port", request.addr[1])

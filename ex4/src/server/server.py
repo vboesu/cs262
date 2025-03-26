@@ -14,6 +14,31 @@ logger = logging.getLogger(__name__)
 
 
 class Server:
+    """
+    Class defining a replica of a server.
+
+    Parameters
+    ----------
+    id : int
+        ID of the server, used for leader elections.
+    host : str
+        Host of the server, usually "0.0.0.0".
+    port : int
+        External port of the server.
+    internal_port : int
+        Internal port through which the replicas communicate.
+    db_url : str
+        Database URL.
+    replicas : dict[int, dict]
+        Specifications of *all* replicas, including self. Keys are IDs,
+        each value should be a dictionary with keys `host`, `port`,
+        and `internal_port`.
+    heartbeat_interval : float
+        Interval for heartbeats from the leader, in seconds.
+    verbose : int, optional
+        Verbosity of database logging, by default 0.
+    """
+
     def __init__(
         self,
         id: int,
@@ -21,7 +46,7 @@ class Server:
         port: int,
         internal_port: int,
         db_url: str,
-        replicas: list[tuple[str, int]],
+        replicas: dict[int, dict],
         heartbeat_interval: float,
         verbose: int = 0,
     ):
@@ -34,14 +59,16 @@ class Server:
         self.verbose = verbose
         self.db_url = db_url
         self.heartbeat_interval = heartbeat_interval
-        self.election_timeout = 3 * heartbeat_interval
+        self.election_timeout = 3 * heartbeat_interval  # TODO: make customizable
 
         self.clock_lock: threading.Lock = None
         self.clock = 0
 
         # Initially, the leader is chosen as the replica with the smallest id.
-        self.leader_id = min(self.replicas.keys())
-        self.is_leader = self.id == self.leader_id
+        # self.leader_id = min(self.replicas.keys())
+        # self.is_leader = self.id == self.leader_id
+        self.leader_id = None
+        self.is_leader = False
         self.election_lock: threading.Lock = None
         self.election_timer: threading.Timer = None
         self.in_election = False
@@ -258,7 +285,8 @@ class Server:
                 self.leader_id = request.data.get("leader")
 
         elif operation == "internal_election":
-            pass
+            logger.debug("Received election check; starting own election.")
+            self.call_election(force=True)
 
         elif operation == "internal_leader_announce":
             logger.debug("Received new leader announcement.")
@@ -360,15 +388,14 @@ class Server:
         self.internal_sh.default_data["response_port"] = self.internal_port
         self.internal_sh.start_listening(block=False)  # listen on separate thread
 
-        self.election_lock.acquire()
-        if self.is_leader:
-            # Start sending out heartbeats
-            self.election_lock.release()
-            threading.Thread(target=self.send_heartbeats, daemon=True).start()
-        else:
-            # Start monitoring for elections
-            self.election_timer.start()
-            self.election_lock.release()
+        with self.election_lock:
+            if self.is_leader:
+                # Start sending out heartbeats
+                threading.Thread(target=self.send_heartbeats, daemon=True).start()
+            else:
+                # Start monitoring for elections
+                self.election_timer.start()
+                logger.debug("Starting election timer.")
 
         # Set current clock time to latest one in the database
         with self.clock_lock:
@@ -466,10 +493,17 @@ class Server:
         except KeyboardInterrupt:
             pass
 
-    def call_election(self):
-        """Start the process of a leader election."""
+    def call_election(self, force: bool = False):
+        """
+        Start the process of a leader election.
+
+        Parameters
+        ----------
+        force : bool, optional
+            Call election disregarding last heartbeat from leader, by default False.
+        """
         with self.election_lock:
-            if self.in_election:
+            if self.in_election or self.is_leader:
                 return
 
             if time.time() - self.last_heartbeat <= self.election_timeout:
@@ -479,7 +513,10 @@ class Server:
                 )
                 self.election_timer.daemon = True
                 self.election_timer.start()
-                return
+                logger.debug("Restarting election timer.")
+
+                if not force:
+                    return
 
             self.in_election = True
             self.leader_id = None  # TODO? what should happen during an election?
@@ -524,6 +561,14 @@ class Server:
 
         with self.election_lock:
             self.in_election = False
+            if not self.is_leader:
+                # Restart the timer
+                self.election_timer = threading.Timer(
+                    self.election_timeout, self.call_election
+                )
+                self.election_timer.daemon = True
+                self.election_timer.start()
+                logger.debug("Restarting election timer.")
 
     def forward_to_leader(self, request: Request):
         """
