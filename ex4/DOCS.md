@@ -20,7 +20,7 @@ We can start up any number of machines, as long as at the time of the start up o
 Every machine has an internal logical clock. When a machine is added to the system after the first requests have been processed, the replica receiving the request to be processed notices this (because the timestamp of the request is too far in the future), and requests to be brought up to date by the leader. The leader then sends all requests which the new replica hasn't seen yet (in a separate thread so as to not block its usual operation) to the new replica until it has been brought up to date.
 
 ### Run
-To run a server instance, run
+Before starting a server instance, if you use the default configuration arguments, you need to create a folder named `dbs` in the root directory of the exercise. To run a server instance, run
 ```
 python run.py server -i [ID of instance]
 ```
