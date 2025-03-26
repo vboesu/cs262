@@ -388,14 +388,16 @@ class Server:
         self.internal_sh.default_data["response_port"] = self.internal_port
         self.internal_sh.start_listening(block=False)  # listen on separate thread
 
-        with self.election_lock:
-            if self.is_leader:
-                # Start sending out heartbeats
-                threading.Thread(target=self.send_heartbeats, daemon=True).start()
-            else:
-                # Start monitoring for elections
-                self.election_timer.start()
-                logger.debug("Starting election timer.")
+        self.election_lock.acquire()
+        if self.is_leader:
+            self.election_lock.release()
+            # Start sending out heartbeats
+            threading.Thread(target=self.send_heartbeats, daemon=True).start()
+        else:
+            # Start monitoring for elections
+            self.election_timer.start()
+            self.election_lock.release()
+            logger.debug("Starting election timer.")
 
         # Set current clock time to latest one in the database
         with self.clock_lock:
@@ -430,7 +432,8 @@ class Server:
     def broadcast_to_peers(self, request_code: int, data: dict | None = None):
         """
         Broadcast a message to all peers, i.e. all replicas which are not self.
-        Usually only called by the leader. Does not wait for the response.
+        Usually called by the leader or in case of election. Does not wait
+        for the responses.
 
         Parameters
         ----------
