@@ -76,6 +76,7 @@ class SocketHandler:
         in the response queue for a specific request or the general queue
         for new/push requests.
         """
+        self.listen_sock.settimeout(2)  # block, release every 2 seconds
         self.listen_sock.listen(5)  # start accepting connections
         while not self.stop_event.is_set():
             try:
@@ -104,6 +105,9 @@ class SocketHandler:
             except KeyboardInterrupt:
                 logger.info("Received ^C. Closing socket handler.")
                 self.stop_event.set()
+
+            except TimeoutError:
+                pass
 
             except Exception as e:
                 logger.error("%s: %s", e.__class__.__name__, str(e))
@@ -257,7 +261,7 @@ class SocketHandler:
 
         with self.thread_lock:
             if self.lthread is not None:
-                self.lthread.join(timeout=5)
+                self.lthread.join(timeout=2)
 
             if self.pthread is not None:
-                self.pthread.join(timeout=5)
+                self.pthread.join(timeout=2)

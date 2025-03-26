@@ -58,15 +58,51 @@ class Server:
         db.session = db.create_session(self.db_url, self.verbose > 0)
 
     def write_to_log(self, request: Request):
+        """
+        Write a request (which involves a change of state) to the
+        log in the database for persistence and synchronization. Uses
+        the current clock time of `self.clock` as logical timestamp.
+
+        Parameters
+        ----------
+        request : Request
+            Request to store.
+        """
         with self.clock_lock:
             log_entry = Log(clock=self.clock, request=request.serialize())
             db.session.add(log_entry)
             soft_commit(db.session, on_rollback=lambda: error_("Database error."))
 
     def get_log(self, clock: int) -> Log | None:
+        """
+        Retrieve log entry for logical timestamp `clock`
+
+        Parameters
+        ----------
+        clock : int
+            Logical timestamp.
+
+        Returns
+        -------
+        Log | None
+            Log entry for the timestamp, if it exists.
+        """
         return db.session.query(Log).filter_by(clock=clock).first()
 
     def process(self, request: Request) -> tuple | None:
+        """
+        Process a request.
+
+        Parameters
+        ----------
+        request : Request
+            Request to process.
+
+        Returns
+        -------
+        tuple | None
+            If this server is not a leader, returns content of response.
+        """
         response = None
         try:
             if request.request_code not in CODE_TO_OP:
@@ -173,6 +209,16 @@ class Server:
             self.sh.respond_to(request, response_code, response_data)
 
     def receive(self, request: Request):
+        """
+        Receive an incoming request (on the external port) from the
+        processing thread which monitors the socket. Forwards the request
+        to the leader if self is a follower.
+
+        Parameters
+        ----------
+        request : Request
+            Request to receive.
+        """
         self.election_lock.acquire()
         if not self.is_leader:
             # If follower: forward request to leader, do not return a response
@@ -187,6 +233,15 @@ class Server:
         self.process(request)
 
     def receive_internal(self, request: Request):
+        """
+        Receive an incoming request (on the internal port) from the
+        processing thread which monitors the socket.
+
+        Parameters
+        ----------
+        request : Request
+            Request to receive.
+        """
         logger.info(f"Received internal request {request}.")
         if request.request_code not in CODE_TO_OP:
             logger.warning(
@@ -250,6 +305,10 @@ class Server:
                 self.internal_sh.respond_to(request, response_code=response_to_leader)
 
     def start(self):
+        """
+        Start server instance up, including sockets for internal and external
+        communication.
+        """
         # Replica set up
         self.replica_setup()
 
@@ -274,6 +333,9 @@ class Server:
         self.sh.start_listening(block=True)  # listen on main thread
 
     def replica_setup(self):
+        """
+        Setup of everything revolving around replication of the server instance.
+        """
         self.election_lock = threading.RLock()
         self.clock_lock = threading.RLock()
 
@@ -315,6 +377,17 @@ class Server:
                 self.clock = latest_log.clock
 
     def push(self, socket_handler: SocketHandler, *args, **kwargs):
+        """
+        Push message to a socket handler in a separate thread without
+        waiting for a response. This means that the function returns
+        almost instantaneously without waiting for delivery of the message.
+
+        Parameters
+        ----------
+        socket_handler : SocketHandler
+            Socket handler on which the message is sent.
+        """
+
         def _push(_socket_handler: SocketHandler, args, kwargs):
             try:
                 _socket_handler.send(*args, **kwargs)
@@ -328,6 +401,17 @@ class Server:
         ).start()
 
     def broadcast_to_peers(self, request_code: int, data: dict | None = None):
+        """
+        Broadcast a message to all peers, i.e. all replicas which are not self.
+        Usually only called by the leader. Does not wait for the response.
+
+        Parameters
+        ----------
+        request_code : int
+            (Internal) request code.
+        data : dict | None, optional
+            Message data, by default None
+        """
         for peer_id, peer in self.replicas.items():
             if peer_id == self.id:
                 continue
@@ -341,9 +425,19 @@ class Server:
             )
 
     def push_to_leader(self, request_code: int, data: dict | None = None):
+        """
+        Send a message to the leader without waiting for a response.
+
+        Parameters
+        ----------
+        request_code : int
+            (Internal) request code.
+        data : dict | None, optional
+            Message data, by default None
+        """
         with self.election_lock:
             if self.leader_id is None:
-                raise ValueError("No leader set.")
+                return
 
             target = (
                 self.replicas[self.leader_id]["host"],
@@ -358,7 +452,10 @@ class Server:
         )
 
     def send_heartbeats(self):
-        # Leader sends heartbeat messages to all peers periodically.
+        """
+        Periodically send heartbeats to the peer replicas. Always tries all
+        possible replicas. Meant to be run in a daemon thread.
+        """
         try:
             while True:
                 self.broadcast_to_peers(
@@ -370,11 +467,13 @@ class Server:
             pass
 
     def call_election(self):
+        """Start the process of a leader election."""
         with self.election_lock:
             if self.in_election:
                 return
 
             if time.time() - self.last_heartbeat <= self.election_timeout:
+                # No need to call an election just yet...
                 self.election_timer = threading.Timer(
                     self.election_timeout, self.call_election
                 )
@@ -427,12 +526,34 @@ class Server:
             self.in_election = False
 
     def forward_to_leader(self, request: Request):
+        """
+        Forward a request to the leader. Called by follower replicas when they
+        receive a request on their external port.
+
+        Parameters
+        ----------
+        request : Request
+            Request to forward.
+        """
         request_bytes = request.serialize()
         self.push_to_leader(
             OP_TO_CODE["internal_forward_request"], {"request": request_bytes}
         )
 
     def teach_replica(self, replica_id: int, next_log: int):
+        """
+        Bring a new replica up to speed based on own (authoritative) log.
+        Recursively sends each request in the log which the new replica hasn't
+        seen until the current logical clock time is reached (which hopefully
+        happens). Meant to be run in a daemon thread.
+
+        Parameters
+        ----------
+        replica_id : int
+            ID of replica to teach.
+        next_log : int
+            Logical timestamp of the log entry to be transmitted.
+        """
         if next_log < 0:
             return
 
