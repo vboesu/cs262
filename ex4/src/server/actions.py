@@ -6,7 +6,6 @@ from sqlalchemy.sql import func
 from src.common import hash_password, RequestCode
 from src.models import Message, User
 
-# from .socket import ServerSocketHandler, connected_clients
 from .utils import error_, op, soft_commit
 from . import db
 
@@ -254,8 +253,9 @@ def read_messages(
         )
         .order_by(Message.timestamp.desc())
     )
-    ct_query = db.session.query(func.count(Message.id)).filter_by(
-        to_id=current_user.id, read_at=None
+    ct_query = db.session.query(func.count(Message.id)).filter(
+        ((Message.to_id == current_user.id) & (Message.read_at.is_not(None)))
+        | (Message.from_id == current_user.id)
     )
 
     # Pagination
