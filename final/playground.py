@@ -95,6 +95,7 @@ def before_commit_handler(session: so.Session):
     session : sqlalchemy.orm.Session
         Current session engaged in transaction.
     """
+    print("BEFORE COMMIT", session)
     ### DEFAULTS
     for obj in session.new:
         for key, column in sa.inspect(obj.__class__).columns.items():
@@ -202,3 +203,8 @@ if __name__ == "__main__":
 
         obj5.value = "efg"
         session.commit()
+
+        # Read objects
+        objects = session.execute(sa.select(MyModel)).scalars()
+        for obj in objects:
+            print("got", obj)
