@@ -1,23 +1,21 @@
-from flask import Flask, request
+from flask import Blueprint, request, g
 
 import logging
 import sqlalchemy as sa
 import sqlalchemy.orm as so
 
-from db import SQLiteDatabase
 from utils import get_query_columns, is_strong_query, validate_query_columns
 
 logging.basicConfig(level=logging.DEBUG)
 
 
-app = Flask(__name__)
-db = SQLiteDatabase("database.db")
+api = Blueprint("api", __name__)
 logger = logging.getLogger(__name__)
 
 
-@app.route("/<schema>", methods=["GET"])
+@api.route("/<schema>", methods=["GET"])
 def select(schema: str):
-    if (model := db.tables.get(schema)) is None:
+    if (model := g.db.tables.get(schema)) is None:
         return {"error": f"Schema {schema} not found."}, 404
 
     columns = get_query_columns(request)
@@ -32,7 +30,7 @@ def select(schema: str):
         return [], 200  # TODO
 
     # WEAK SELECT QUERY
-    with so.Session(db.engine) as session:
+    with so.Session(g.db.engine) as session:
         if columns:
             query = sa.select(*[getattr(model, c) for c in columns])
             return [
@@ -45,9 +43,9 @@ def select(schema: str):
             return [row.to_dict() for row in session.execute(query).scalars()]
 
 
-@app.route("/<schema>/<id>", methods=["GET"])
+@api.route("/<schema>/<id>", methods=["GET"])
 def select_id(schema: str, id: str):
-    if (model := db.tables.get(schema)) is None:
+    if (model := g.db.tables.get(schema)) is None:
         return {"error": f"Schema {schema} not found."}, 404
 
     columns = get_query_columns(request)
@@ -62,7 +60,7 @@ def select_id(schema: str, id: str):
         return [], 200  # TODO
 
     # WEAK SELECT QUERY
-    with so.Session(db.engine) as session:
+    with so.Session(g.db.engine) as session:
         if columns:
             query = sa.select(*[getattr(model, c) for c in columns])
             query = query.where(model.id == id)
@@ -77,9 +75,9 @@ def select_id(schema: str, id: str):
             return (obj.to_dict(), 200) if obj is not None else ({}, 404)
 
 
-@app.route("/<schema>", methods=["POST"])
+@api.route("/<schema>", methods=["POST"])
 def insert(schema: str):
-    if (model := db.tables.get(schema)) is None:
+    if (model := g.db.tables.get(schema)) is None:
         return {"error": f"Schema {schema} not found."}, 404
 
     data = request.get_json()
@@ -94,7 +92,7 @@ def insert(schema: str):
         return [], 200  # TODO
 
     # WEAK INSERT QUERY
-    with so.Session(db.engine) as session:
+    with so.Session(g.db.engine) as session:
         try:
             obj = model(**data)
             session.add(obj)
@@ -106,9 +104,9 @@ def insert(schema: str):
     return {}, 201
 
 
-@app.route("/<schema>", methods=["PATCH"])
+@api.route("/<schema>", methods=["PATCH"])
 def update(schema: str):
-    if (model := db.tables.get(schema)) is None:
+    if (model := g.db.tables.get(schema)) is None:
         return {"error": f"Schema {schema} not found."}, 404
 
     data = request.get_json()
@@ -124,7 +122,7 @@ def update(schema: str):
         return [], 200  # TODO
 
     # WEAK UPDATE QUERY
-    with so.Session(db.engine) as session:
+    with so.Session(g.db.engine) as session:
         try:
             query = sa.update(model.__table__).values(data)
             session.execute(query)
@@ -136,9 +134,9 @@ def update(schema: str):
     return {}, 200
 
 
-@app.route("/<schema>/<id>", methods=["PATCH"])
+@api.route("/<schema>/<id>", methods=["PATCH"])
 def update_id(schema: str, id: str):
-    if (model := db.tables.get(schema)) is None:
+    if (model := g.db.tables.get(schema)) is None:
         return {"error": f"Schema {schema} not found."}, 404
 
     data = request.get_json()
@@ -154,7 +152,7 @@ def update_id(schema: str, id: str):
         return [], 200  # TODO
 
     # WEAK UPDATE QUERY
-    with so.Session(db.engine) as session:
+    with so.Session(g.db.engine) as session:
         try:
             query = sa.update(model.__table__).where(model.id == id).values(data)
             session.execute(query)
@@ -167,4 +165,4 @@ def update_id(schema: str, id: str):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=9000, threaded=True)
+    api.run(host="0.0.0.0", port=9000, threaded=True)
