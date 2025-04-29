@@ -12,21 +12,21 @@ def generate_uuid() -> str:
     return uuid.uuid4().hex
 
 
-def current_timestamp() -> Callable:
-    """Ensure that the same timestamp is used throughout the transaction."""
-    transactions = {}
+# def current_timestamp() -> Callable:
+#     """Ensure that the same timestamp is used throughout the transaction."""
+#     transactions = {}
 
-    def fn(session: so.Session = None) -> datetime:
-        if session is not None and hasattr(session, "get_transaction"):
-            trans = session.get_transaction()
-            if trans not in transactions:
-                transactions[trans] = datetime.now()
+#     def fn(session: so.Session = None) -> datetime:
+#         if session is not None and hasattr(session, "get_transaction"):
+#             trans = session.get_transaction()
+#             if trans not in transactions:
+#                 transactions[trans] = datetime.now()
 
-            return transactions[trans]
+#             return transactions[trans]
 
-        return datetime.now()
+#         return datetime.now()
 
-    return fn
+#     return fn
 
 
 # UUID primary key
@@ -36,7 +36,7 @@ uuidpk = Annotated[str, so.mapped_column(default=generate_uuid, primary_key=True
 # Timestamp per transaction
 timestamp_t = Annotated[
     datetime,
-    so.mapped_column(nullable=False, default=current_timestamp()),
+    so.mapped_column(nullable=False, default=datetime.now),
 ]
 
 Base = so.declarative_base()
