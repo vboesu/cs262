@@ -1,54 +1,28 @@
-from functools import cached_property
-from pathlib import Path
-
-import json
+from datetime import datetime
 import logging
 import sqlite3
+
+from pathlib import Path
+from uuid import uuid4
 from typing import Literal
 
-# import sqlalchemy as sa
-# import sqlalchemy.orm as so
-
-# from models import Base
 from query import Query
 
 logger = logging.getLogger(__name__)
 
-ERRORS_TO_STATUS_CODE = {
-    "l7de": 10,  # UnsupportedCompilationError
-    "xd1r": 11,  # AwaitRequired
-    "xd2s": 12,  # MissingGreenlet
-    "dbapi": 90,  # DBAPIError
-    "rvf5": 91,  # InterfaceError
-    "4xp6": 92,  # DatabaseError
-    "e3q8": 93,  # OperationalError
-    "gkpj": 94,  # IntegrityError
-    "2j85": 95,  # InternalError
-    "f405": 96,  # ProgrammingError
-    "tw8g": 97,  # NotSupportedError
-}
-
-STATUS_CODE_TO_ERROR_DESCRIPTION = {
-    10: "UnsupportedCompilationError",
-    11: "AwaitRequired",
-    12: "MissingGreenlet",
-    90: "DBAPIError",
-    91: "InterfaceError",
-    92: "DatabaseError",
-    93: "OperationalError",
-    94: "IntegrityError",
-    95: "InternalError",
-    96: "ProgrammingError",
-    97: "NotSupportedError",
-    99: "UnknownError",
-}
-
 
 class SQLiteDatabase:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, setup_script: str | Path | None = None):
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = SQLiteDatabase._dict_factory
         self._ensure_meta()
+
+        if setup_script:
+            with open(setup_script, "r") as f:
+                sql = f.read()
+                cursor = self.conn.cursor()
+                cursor.executescript(sql)
+                self.conn.commit()
 
         self.tables = self._public_tables()
         print("available tables", self.tables)
@@ -64,128 +38,117 @@ class SQLiteDatabase:
         cursor = self.conn.cursor()
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS internal_strong_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            uuid BLOB UNIQUE,
-            query BLOB,
+            transaction_id BLOB,
+            operation_id INTEGER,
+            command INTEGER,
+            schema TEXT,
+            column TEXT NULL,
+            row BLOB NULL,
+            old_value BLOB NULL,
+            new_value BLOB NULL,
+            data BLOB NULL,
+            logical_timestamp INTEGER,
             timestamp DATETIME DEFAULT(STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'))
         )""")
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS internal_eventual_log (
-            uuid BLOB PRIMARY KEY,
-            query BLOB,
+            transaction_id BLOB,
+            operation_id INTEGER,
+            command INTEGER,
+            schema TEXT,
+            column TEXT NULL,
+            row BLOB NULL,
+            old_value BLOB NULL,
+            new_value BLOB NULL,
+            data BLOB NULL,
             timestamp DATETIME DEFAULT(STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'))
         )""")
         self.conn.commit()
 
     def _public_tables(self):
-        _query = Query(
-            query="""
-            SELECT name 
-                FROM sqlite_master 
-            WHERE type='table' 
-                AND name NOT LIKE 'sqlite_%'
-                AND name NOT LIKE 'internal_%'
-            """,
-        )
-        _tables = self.execute(_query)
-        return [row["name"] for row in _tables]
-
-    def execute(self, query: Query, log: Literal["strong", "eventual"] | None = None):
         cursor = self.conn.cursor()
-        cursor.execute(query.query, query.params or [])
-        if log is not None:
+        cursor.execute("""
+        SELECT name 
+            FROM sqlite_master 
+        WHERE type='table' 
+            AND name NOT LIKE 'sqlite_%'
+            AND name NOT LIKE 'internal_%'
+        """)
+        return [row["name"] for row in cursor.fetchall()]
+
+    def _log_entry(
+        self,
+        cursor: sqlite3.Cursor,
+        query: Query,
+        log: Literal["strong", "eventual"],
+        transaction_id: bytes,
+        logical_timestamp: int = -1,
+        timestamp: datetime | None = None,
+    ) -> Query:
+        query.transaction_id = transaction_id
+        query.timestamp = timestamp
+        query.logical_timestamp = logical_timestamp
+
+        for op_id, op in enumerate(query.ops):
             cursor.execute(
-                f"INSERT INTO internal_{log}_log (uuid, query) VALUES (?, ?)",
-                [query.id, query.encode()],
+                *op.to_sql(f"internal_{log}_log", op_id + 1, log == "strong")
             )
-        self.conn.commit()
-        return cursor.fetchall()
 
-    # def db_setup(self):
-    #     self.base.metadata.create_all(self.engine)
+        return query
 
-    #     # map from table -> model class
-    #     self.tables = {}
-
-    #     for mapper in self.base.registry.mappers:
-    #         cls = mapper.class_
-    #         if not cls.__name__.startswith("_"):
-    #             tblname = cls.__tablename__
-    #             self.tables[tblname] = cls
-
-    def try_query(
+    def write_query(
         self,
         query: Query,
-        log: Literal["strong", "eventual"] | None = None,
-    ) -> tuple[int, list]:
+        log: Literal["strong", "eventual"] = "eventual",
+        transaction_id: bytes | None = None,
+        logical_timestamp: int = -1,
+        timestamp: datetime | None = None,
+    ) -> tuple[int, Query]:
+        cursor = self.conn.cursor()
+        self.conn.execute("BEGIN")
+        transaction_id = transaction_id or uuid4().bytes
+
+        # Try each of the steps in the query, checking at each step that at least
+        # one row was affected to make sure that the update, insert, and deletes
+        # are consistent and not out of order.
+
         try:
-            logger.debug(f"TRY QUERY {query}")
-            result = self.execute(query, log)
-            status = 0
-            logger.debug(f"EXECUTED QUERY {query} TO LOG {log} WITH RESULT {result}")
+            for op in query.ops:
+                cursor.execute(*op.as_sql())
+
+                if cursor.rowcount == 0:
+                    # If no row was affected, the operation failed. This is
+                    # usually because of some type of race condition or inconsistency
+                    # problem, so now we need to go and fix it. TODO
+                    raise sqlite3.DatabaseError(f"Operation {op} failed.")
+
+            query = self._log_entry(
+                cursor,
+                query,
+                log,
+                transaction_id,
+                logical_timestamp,
+                timestamp,
+            )
+            self.conn.commit()
+            return 0, query
 
         except sqlite3.Error as e:
-            result = []
+            logger.error("Failed to complete query, rolling back.")
+            logger.error(e, exc_info=True)
+            self.conn.rollback()
+
+            return getattr(e, "sqlite_errorcode", 99), query
+
+    def try_execute(self, query: str, params: list = []) -> tuple[int, list]:
+        cursor = self.conn.cursor()
+        status, result = 0, []
+        try:
+            cursor.execute(query, params)
+            result = cursor.fetchall()
+
+        except sqlite3.Error as e:
+            logger.error(e, exc_info=True)
             status = getattr(e, "sqlite_errorcode", 99)
 
         return status, result
-
-    # def try_query(self, query: bytes) -> int:
-    #     """
-    #     Attempt to execute a query on the current database.
-
-    #     Parameters
-    #     ----------
-    #     query : bytes
-    #         Query to be attempted.
-
-    #     Returns
-    #     -------
-    #     int
-    #         Status (0 = success, >0 = failure)
-    #     """
-    #     query_id = query[:16]
-    #     query_type = query[16:17]  # e.g. insert, update, etc.
-    #     query_schema, _, query_raw_data = query[17:].partition(b" ")
-    #     query_schema = query_schema.decode("ascii")
-    #     logger.debug(f"RAW QUERY DATA {query_raw_data}")
-    #     query_data = json.loads(query_raw_data) if query_raw_data else {}
-
-    #     logger.debug(
-    #         f"Attempting query {query_id} ({query_type} on {query_schema}): {query_data}"
-    #     )
-
-    #     if (model := self.tables.get(query_schema)) is None:
-    #         return 99
-
-    #     with so.Session(self.engine) as session:
-    #         try:
-    #             if query_type == b"I":
-    #                 # INSERT
-    #                 obj = model(**query_data)
-    #                 session.add(obj)
-    #                 session.commit()
-
-    #             elif query_type == b"U":
-    #                 # UPDATE
-    #                 where = sa.true()
-    #                 for key in list(query_data.keys()):
-    #                     if key.startswith("where__"):
-    #                         col = key[7:]
-    #                         value = query_data.pop(key)
-    #                         where &= getattr(model, col) == value
-
-    #                 u_query = sa.update(model.__table__).where(where).values(query_data)
-    #                 session.execute(u_query)
-    #                 session.commit()
-
-    #             else:
-    #                 raise ValueError()  # TMP
-
-    #         except sa.exc.SQLAlchemyError as e:
-    #             logger.info(f"Unable to complete query {query}. {str(e)}")
-    #             if hasattr(e, "code"):
-    #                 return ERRORS_TO_STATUS_CODE.get(e.code, 99)
-
-    #     logger.debug("Success!")
-    #     return 0

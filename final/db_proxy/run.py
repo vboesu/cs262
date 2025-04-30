@@ -30,6 +30,7 @@ if __name__ == "__main__":
                 "users.password_hash",
                 "accounts.*",
             ],
+            "SETUP_SCRIPT": "setup.sql",
         }
     )
 

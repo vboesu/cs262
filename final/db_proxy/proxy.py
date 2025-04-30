@@ -1,4 +1,4 @@
-from collections.abc import Iterable
+from collections.abc import Hashable, Iterable
 import random
 import secrets
 import selectors
@@ -18,8 +18,8 @@ from flask import Flask, g
 from api import api as api_bp
 from consensus import Timer
 from db import SQLiteDatabase
-from query import Query
-from utils import is_strong_query
+from query import Operation, Query
+from utils import build_select_query
 
 logger = logging.getLogger(__name__)
 
@@ -71,8 +71,13 @@ class Proxy:
         self.server_id: int = self.rc.get("SERVER_ID", 1)
         assert self.server_id in self.replicas
         self.sc = self.replicas[self.server_id]  # server (self) config
-        self.strong_columns = self.rc.get("STRONG_CONSISTENCY", [])
         self.max_peer_id = max(self.replicas.keys())
+
+        # Consistency markers
+        self.strong_columns = set(self.rc.get("STRONG_CONSISTENCY", []))
+        self.strong_tables = set(
+            col.split(".")[0] for col in self.strong_columns if col.split(".")[1] == "*"
+        )
 
         # Election setup
         self.hb_int = self.rc.get("HEARTBEAT_INTERVAL_MS", 100)  # in ms
@@ -90,7 +95,9 @@ class Proxy:
             self.status = "leader"
 
         # Query logging
-        self.db = SQLiteDatabase(self.instance_path / "database.db")
+        self.db = SQLiteDatabase(
+            self.instance_path / "database.db", self.rc.get("SETUP_SCRIPT")
+        )
         self.async_transaction_ids = set()
         self.async_queue: Queue[Query] = Queue()
 
@@ -100,6 +107,7 @@ class Proxy:
         # Queues
         self.queue_lock: Lock = None
         self.queues: dict[bytes, Queue] = {}
+        self.req_id: int = 0
 
         # Socket connections to other replicas
         self.listen_sock: socket.socket = None
@@ -159,20 +167,21 @@ class Proxy:
 
         with self.clock_lock:
             # Update logical clock from strong log in database
-            q = Query(
-                method="SELECT",
-                query="SELECT MAX(id) AS max FROM internal_strong_log",
+            status, result = self.db.try_execute(
+                "SELECT MAX(logical_timestamp) AS max FROM internal_strong_log"
             )
-            status, results = self.db.try_query(q)
             assert status == 0
-            self.clock = results[0]["max"] or 0
+            self.clock = result[0]["max"] or 0
+            self.clock += 1
             logger.debug(f"Started with logical clock {self.clock}")
 
             # TODO: Get latest entries from async logs
 
         # Start establishing connections to other replicas
-        th = Thread(target=self._establish_connections, daemon=True)
-        th.start()
+        Thread(target=self._establish_connections, daemon=True).start()
+
+        # Start processing weak queries
+        Thread(target=self._handle_weak_queries, daemon=True).start()
 
         self.internal_started.set()
 
@@ -217,40 +226,93 @@ class Proxy:
     ### EXTERNAL API HELPERS
     def _before_api_request(self):
         """
-        Make proxy and database available to API endpoints.
+        Make proxy available to API endpoints.
         """
         g.proxy = self
-        g.db = self.db
 
     def dispatch(
         self,
         method: str,
         schema: str,
-        query: str,
-        params: list,
-        columns: list[str],
+        data: dict = {},
+        row_id: Hashable = None,
     ):
         """
         Process a query from the external API.
         """
-        # Determine the consistency requirement for the query
-        strong = is_strong_query(columns, self.strong_columns)
+        assert method in {"GET", "POST", "PATCH", "DELETE"}
 
-        query = Query(method=method, schema=schema, query=query, params=params)
-        logger.debug(f"DISPATCHING QUERY {query} (strong={strong})")
-
-        if method == "SELECT":
+        if method == "GET":
             # SELECT queries can be performed consistently by any replica
-            status, result = self.db.try_query(query)
-            logger.debug(f"FINISHED QUERY WITH RESULT {result}")
+            query, params = build_select_query(schema, data, row_id)
+            status, result = self.db.try_execute(query, params)
 
             if status != 0:
                 return {"error": f"Database error (code: {status})"}, 400
 
             return result, 200
 
-        elif strong:
-            # Forward strong queries to the leader
+        elif method == "POST":
+            # INSERT
+            op = Operation(b"I", schema, data=data)
+            query = Query([op])
+            strong = schema in [col.split(".")[0] for col in self.strong_columns]
+
+        elif method == "PATCH":
+            # UPDATE
+            assert row_id is not None
+
+            # Strong query if any of the relevant columns are strong or the entire
+            # table is marked as strong
+            strong = schema in self.strong_tables
+            strong |= bool(
+                self.strong_columns & set(f"{schema}.{col}" for col in data.keys())
+            )
+
+            # First, we need to make sure that the element exists
+            status, result = self.db.try_execute(
+                f"SELECT {', '.join(data.keys())} FROM {schema} WHERE id = ?", [row_id]
+            )
+            if len(result) != 1:
+                # This row does not (yet) exist. Error in the case of strong query,
+                # temporary error/merge conflict (potentially wait for data to arrive)
+                # in the case of weak query. For now, throw an error.
+                # TODO: for updates, should it be part of the client's code to keep track
+                # of what the old value is? Probably, since it is most likely that race
+                # conditions happen between the client seeing a row and deciding to edit it
+                # rather than telling the server to edit it (and the server just taking
+                # whatever value it currently has as the one that the client last saw)
+                return {"error": "Temporary error."}, 400
+
+            # Next, we can update each field individually
+            ops = [
+                Operation(b"U", schema, col, row_id, result[0][col], data[col])
+                for col in data.keys()
+            ]
+            query = Query(ops)
+
+        elif method == "DELETE":
+            # DELETE
+            assert row_id is not None
+
+            # Strong query if any of the affected columns are strong
+            strong = schema in [col.split(".")[0] for col in self.strong_columns]
+
+            # First, we need to make sure that the element exists
+            status, result = self.db.try_execute(
+                f"SELECT id FROM {schema} WHERE id = ?", [row_id]
+            )
+            if len(result) != 1:
+                # Same note as in UPDATE
+                return {"error": "Temporary error."}, 400
+
+            query = Query([Operation(b"D", schema, row=row_id)])
+
+        logger.debug(f"Prepared {query} for dispatch, {query.ops}")
+        for op in query.ops:
+            logger.debug(op)
+
+        if strong:
             status = self.send_query_to_leader(query)
             logger.debug(f"FINISHED QUERY WITH STATUS {status}")
 
@@ -259,18 +321,16 @@ class Proxy:
 
             return {}, 200
 
-        else:
-            # Implement weak queries ourselves
-            status, result = self.db.try_query(query, "eventual")
-            logger.debug(f"FINISHED QUERY WITH STATUS {status}")
+        # Implement weak query directly
+        status, query = self.db.write_query(query, "eventual")
 
-            if status != 0:
-                return {"error": f"Database error (code: {status})"}, 400
+        if status != 0:
+            return {"error": f"Database error (code: {status})"}, 400
 
-            # Send query to other replicas
-            self._broadcast(b"A", query.encode())
+        # Broadcast query to other replicas
+        self._broadcast(b"A", query.encode())
 
-            return {}, 200
+        return {}, 200
 
     ### INTERNAL
     def _connect_to_peer(self, peer_id: int, raise_exc: bool = False):
@@ -578,10 +638,6 @@ class Proxy:
             # The leader sent us an earlier entry to learn about
             self.__learn(data, payload)
 
-        # elif cmd == b"K":
-        #     # We received a keepalive
-        #     self.__keepalive(data, payload)
-
     def _wait_for_queues(self, keys: Iterable, timeout: float = 5.0) -> dict:
         """
         Monitor `keys` for objects placed in the corresponding queues, return
@@ -627,14 +683,25 @@ class Proxy:
         while not self.stop_event.is_set():
             try:
                 query = self.async_queue.get(timeout=1)
-                if query.id in self.async_transaction_ids:
+                logger.info(f"Got async query {query}")
+                if query.transaction_id in self.async_transaction_ids:
                     continue
 
-                status, _ = self.db.try_query(query, "eventual")
+                # Write query with transaction ID and timestamp from other replica
+                # for complete consistency
+                status, query = self.db.write_query(
+                    query,
+                    "eventual",
+                    query.transaction_id,
+                    timestamp=query.timestamp,
+                )
+
                 if status == 0:
-                    self.async_transaction_ids.add(query.id)
+                    self.async_transaction_ids.add(query.transaction_id)
                 else:
                     logger.info(f"Query {query} failed, exited with status {status}.")
+                    # TODO: fix conflicts
+                    # self.async_queue.put(query)
 
             except Empty:
                 pass
@@ -671,7 +738,7 @@ class Proxy:
         # TODO: check if this can create deadlock bc of ordering
         with self.election_lock:
             with self.clock_lock:
-                if clock > self.clock + 1:
+                if clock > self.clock:
                     self.status = "learner"
                     self._start_learning()
 
@@ -740,43 +807,56 @@ class Proxy:
     def __process_strong_query(self, data: SocketData, payload: bytes):
         """Attempt a proposed strong query, return the status."""
         try:
+            # TODO: replace clock by query.logical_timestamp
             clock = int.from_bytes(payload[:4], "big", signed=False)
             query = Query.decode(payload[4:])
-            r_payload = query.id
+            r_payload = query.transaction_id
 
             logger.debug(f"Attempting strong query {query} @ {clock}.")
 
             with self.election_lock:
                 if self.status == "learner":
-                    self._prepare_send(data, b"R", r_payload + b"\xff")
+                    status = 255
+                    r_payload += status.to_bytes(2, "big", signed=False)
+                    self._prepare_send(data, b"R", r_payload)
                     return
 
             with self.clock_lock:
-                if clock > self.clock + 1:
+                if clock > self.clock:
                     # We're missing some information but aren't learning yet
                     self._start_learning()
-                    self._prepare_send(data, b"R", r_payload + b"\xff")
+                    status = 255
+                    r_payload += status.to_bytes(2, "big", signed=False)
+                    self._prepare_send(data, b"R", r_payload)
                     return
 
-                assert clock >= self.clock
+                assert clock == self.clock
 
-            status, _ = self.db.try_query(query, "strong")
-            if status == 0:
-                self.clock += 1
+                # Use ID, logical timestamp, and timestamp from leader
+                status, _ = self.db.write_query(
+                    query,
+                    "strong",
+                    query.transaction_id,
+                    query.logical_timestamp,
+                    query.timestamp,
+                )
+
+                if status == 0:
+                    self.clock += 1
 
         except ValueError as e:
             logger.warning(f"Unable to parse query from payload {payload}")
             logger.error(e, exc_info=True)
             status = 99
 
-        self._prepare_send(
-            data, b"R", r_payload + status.to_bytes(1, "big", signed=False)
-        )
+        r_payload += status.to_bytes(2, "big", signed=False)
+        self._prepare_send(data, b"R", r_payload)
 
     def __process_weak_query(self, data: SocketData, payload: bytes):
         """Process a weak query by putting it in the async queue."""
         try:
             query = Query.decode(payload)
+            logger.debug(f"Processing weak query {query}...")
             self.async_queue.put(query)
 
         except ValueError:
@@ -784,19 +864,22 @@ class Proxy:
 
     def __status_query(self, data: SocketData, payload: bytes):
         """Update the status of a query."""
-        query_id = payload[:16]
-        query_status = int.from_bytes(payload[16:17])
+        req_id = int.from_bytes(payload[:2], "big", signed=False)
+        query_status = int.from_bytes(payload[2:4], "big", signed=False)
+        logger.debug(f"Received final query status {query_status} for {req_id}")
 
         with self.queue_lock:
-            if query_id not in self.queues:
+            if req_id not in self.queues:
                 logger.warning("Received status of unknown query...")
             else:
-                self.queues[query_id].put(query_status)
+                self.queues[req_id].put(query_status)
 
     def __distribute_query(self, data: SocketData, payload: bytes):
         """Send a query out to the other replicas."""
-        status = self.propose_query(Query.decode(payload))  # blocks
-        self._prepare_send(data, b"S", payload[:16] + status.to_bytes(1))
+        status = self.propose_query(Query.decode(payload[2:]))  # blocks
+        self._prepare_send(
+            data, b"S", payload[:2] + status.to_bytes(2, "big", signed=False)
+        )
 
     def __collect_query(self, data: SocketData, payload: bytes):
         """Collect the response from a follower for the query."""
@@ -813,27 +896,29 @@ class Proxy:
 
     def __teach(self, data: SocketData, payload: bytes):
         """Teach a follower about the requested query from the strong log."""
-        query_id = int.from_bytes(payload[:4], "big", signed=False)
+        clock = int.from_bytes(payload[:4], "big", signed=False)
 
         self.clock_lock.acquire()
-        if query_id <= self.clock:
+        if clock < self.clock:
             # There is still something left to learn
             self.clock_lock.release()
-            q = Query(
-                query="SELECT query FROM internal_strong_log WHERE id = ?",
-                params=[query_id],
+
+            # Get all operations from the database
+            status, result = self.db.try_execute(
+                "SELECT * FROM internal_strong_log WHERE logical_timestamp = ?",
+                [clock],
             )
-            status, result = self.db.try_query(q)
             if status == 0 and len(result) > 0:
                 # We got the log entry
-                r_payload = payload[:4] + b"\x00" + result[0]["query"]
+                ops = [Operation.from_sql(row) for row in result]
+                r_payload = payload[:4] + b"\x00" + Query(ops).encode()
                 self._prepare_send(data, b"L", r_payload)
 
             elif status == 0 and len(result) == 0:
                 # This entry does not exist??
                 self._prepare_send(data, b"L", payload[:4] + b"\x01")
 
-        elif query_id > self.clock:
+        elif clock >= self.clock:
             # This replica already knows everything there is to know!
             self.clock_lock.release()
             self._prepare_send(data, b"L", payload[:4] + b"\x02")
@@ -858,7 +943,7 @@ class Proxy:
         def _keep_learning():
             while True:
                 with self.clock_lock:
-                    next_log = (self.clock + 1).to_bytes(4, "big", signed=False)
+                    next_log = self.clock.to_bytes(4, "big", signed=False)
 
                 with self.queue_lock:
                     queue = Queue()
@@ -884,11 +969,19 @@ class Proxy:
 
                 if status == b"\x00":
                     query = Query.decode(result[1:])
-                    s, _ = self.db.try_query(query, "strong")
-                    logger.debug(f"Learned about strong query {query.id}")
+                    s, r = self.db.write_query(
+                        query,
+                        "strong",
+                        query.transaction_id,
+                        query.logical_timestamp,
+                        query.timestamp,
+                    )
+                    logger.debug(f"Learned about strong query {query.transaction_id}")
 
                     if s != 0:
-                        logger.warning(f"Failed to implement query {query.id}.")
+                        logger.warning(
+                            f"Failed to implement query {query.transaction_id}."
+                        )
 
                     with self.clock_lock:
                         self.clock += 1
@@ -998,29 +1091,42 @@ class Proxy:
         if self.status == "leader":
             self.election_condition.release()
             logger.debug("As leaser, we propose query directly")
-            return self.propose_query(query)  # blocks
+            status, query = self.propose_query(query)  # blocks
+            return status
 
         self.election_condition.release()
 
         with self.queue_lock:
-            self.queues[query.id] = Queue()
+            req = self.req_id
+            self.req_id = (self.req_id + 1) % (1 << 16)
+            self.queues[req] = Queue()
 
-        self._send_to_peer(self.leader, b"Q", query.encode())
-        result = self.queues[query.id].get()  # blocks
+        self._send_to_peer(
+            self.leader,
+            b"Q",
+            req.to_bytes(2, "big", signed=False) + query.encode(),
+        )
+        result = self.queues[req].get()  # blocks
 
         # Clean up
         with self.queue_lock:
-            self.queues.pop(query.id)
+            self.queues.pop(req)
 
         return result
 
-    def propose_query(self, query: Query) -> int:
+    def propose_query(self, query: Query) -> tuple[int, Query]:
         # Try query in leader
-        status, result = self.db.try_query(query, "strong")
+        with self.clock_lock:
+            status, query = self.db.write_query(
+                query,
+                "strong",
+                logical_timestamp=self.clock,
+            )
+
         if status != 0:
             return status
 
-        logger.debug(f"Implemented in leader {query} with result {result}")
+        logger.debug(f"Implemented in leader {query}")
 
         with self.clock_lock:
             payload = self.clock.to_bytes(4, "big", signed=False) + query.encode()
@@ -1035,7 +1141,7 @@ class Proxy:
                 continue
 
             with self.queue_lock:
-                self.queues[(query.id, id)] = Queue()
+                self.queues[(query.transaction_id, id)] = Queue()
 
         # Attempt to establish connection with all replicas
         self._broadcast(b"P", payload)
@@ -1043,7 +1149,7 @@ class Proxy:
         logger.debug(f"Broadcasted {query}")
 
         with self.connections_lock:
-            qs_to_watch = [(query.id, id) for id in self.connections]
+            qs_to_watch = [(query.transaction_id, id) for id in self.connections]
 
         # Wait for all of the queries to return (up to some timeout)
         results = self._wait_for_queues(qs_to_watch, timeout=1)
@@ -1058,6 +1164,6 @@ class Proxy:
         # we are trivially successful. We can again do an additional,
         # Raft-like check to ensure that we got a majority of votes.
         if votes >= total:
-            return 0
+            return 0, query
 
-        return 1
+        return 1, query
