@@ -1,4 +1,5 @@
-from collections.abc import Hashable, Iterable
+from functools import cached_property
+import os
 import random
 import secrets
 import selectors
@@ -7,19 +8,20 @@ import logging
 import time
 import weakref
 
+from collections.abc import Hashable, Iterable
 from pathlib import Path
 from queue import Queue, Empty
+from selectors import EVENT_READ as RD, EVENT_WRITE as WR
 from threading import Thread, Lock, RLock, Event, Condition
 from typing import Literal
-from selectors import EVENT_READ as RD, EVENT_WRITE as WR
 
+from dns import resolver
 from flask import Flask, g
 
 from api import api as api_bp
-from consensus import Timer
 from db import SQLiteDatabase
 from query import Operation, Query
-from utils import build_select_query
+from utils import Timer, build_select_query
 
 logger = logging.getLogger(__name__)
 
@@ -32,16 +34,15 @@ PROTOCOL_VERSION = 1
 class SocketData:
     def __init__(
         self,
-        addr: str,
+        host: str,
         sock: socket.socket,
         inb: bytes = b"",
         outb: bytes = b"",
     ):
-        self.addr = addr
+        self.host = host
         self.sock = sock
         self.inb = inb
         self.outb = outb
-        self.id = None
         self.inb_lock: Lock = RLock()
         self.outb_lock: Lock = RLock()
 
@@ -67,11 +68,14 @@ class Proxy:
         # Internal replica setup
         self.instance_path = Path(self.rc.get("INSTANCE_PATH", "instance"))
         self.instance_path.mkdir(0o755, parents=True, exist_ok=True)
-        self.replicas: dict[int, str] = self.rc.get("REPLICAS", {})
-        self.server_id: int = self.rc.get("SERVER_ID", 1)
-        assert self.server_id in self.replicas
-        self.sc = self.replicas[self.server_id]  # server (self) config
-        self.max_peer_id = max(self.replicas.keys())
+        self.n_replicas = int(os.getenv("N_REPLICAS"))  # max number of replicas
+
+        # Docker setup
+        self.service_dns = os.getenv("SERVICE_DNS")  # how to find other replicas
+        self.internal_port = int(os.getenv("INTERNAL_PORT", 8001))
+        self.external_port = int(os.getenv("EXTERNAL_PORT", 8000))
+        self.server_id = int(os.getenv("SERVER_ID"))
+        self.peers: set[str] = set()  # IP addresses
 
         # Consistency markers
         self.strong_columns = set(self.rc.get("STRONG_CONSISTENCY", []))
@@ -83,16 +87,12 @@ class Proxy:
         self.hb_int = self.rc.get("HEARTBEAT_INTERVAL_MS", 100)  # in ms
         self.max_election_timeout = self.rc.get("ELECTION_TIMEOUT_MS", 1000)  # in ms
         assert self.max_election_timeout > 5 * self.hb_int
-        self.election_lock: Lock = None
+        self.election_lock = RLock()
         self.election_timer: Timer = None
-        self.election_condition: Condition = None
+        self.election_condition = Condition()
         self.in_election: bool = False
-        self.last_leader_heartbeat: float = 0.0
         self.status: Literal["leader", "follower", "learner"] = "follower"
-        self.leader: int | None = None
-
-        if self.server_id == self.leader:
-            self.status = "leader"
+        self.leader: str | None = None  # host of leader
 
         # Query logging
         self.db = SQLiteDatabase(
@@ -101,25 +101,36 @@ class Proxy:
         self.async_transaction_ids = set()
         self.async_queue: Queue[Query] = Queue()
 
-        self.clock_lock: Lock = None
+        self.clock_lock = RLock()
         self.clock: int = 0
+        self.strong_query_in_progress = False
+        self.clock_condition = Condition(self.clock_lock)
 
         # Queues
-        self.queue_lock: Lock = None
+        self.queue_lock = RLock()
         self.queues: dict[bytes, Queue] = {}
-        self.req_id: int = 0
+        self.req_id: int = 1
 
         # Socket connections to other replicas
         self.listen_sock: socket.socket = None
-        self.connections_lock: Lock = None
+        self.connections_lock = RLock()
         self.connections: dict[int, tuple[float, weakref.ref[SocketData]]] = {}
-        self.stop_event: Event = None
+        self.stop_event = Event()
         self.internal_started = Event()
+        self.selector_lock = RLock()
+        self.selector = selectors.DefaultSelector()
+
+        print("IPS", self.ips)
 
     @property
     def term(self) -> int:
         with self.clock_lock:
-            return self.clock * (self.max_peer_id + 1) + self.server_id
+            return self.clock * (self.n_replicas + 1) + self.server_id
+
+    @cached_property
+    def ips(self):
+        _, _, addrs = socket.gethostbyname_ex(socket.gethostname())
+        return set(addrs)
 
     ### SETUP & START
     def start(self):
@@ -136,18 +147,10 @@ class Proxy:
         """
         Start the internal API for handling communication between replicas.
         """
-        self.election_lock = RLock()
-        self.clock_lock = RLock()
-        self.queue_lock = RLock()
-        self.connections_lock = RLock()
-        self.stop_event = Event()
-        self.selector = selectors.DefaultSelector()
-
         # Set up socket for communication between replicas
-        _, port = self.sc.split(":")
         self.listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.listen_sock.bind(("0.0.0.0", int(port)))  # bind to all by default
+        self.listen_sock.bind(("0.0.0.0", self.internal_port))
         self.listen_sock.settimeout(1)
         self.listen_sock.listen(self.rc.get("BACKLOG", 5))
         self.selector.register(self.listen_sock, RD, data=None)
@@ -155,7 +158,6 @@ class Proxy:
         logger.info(f"Started internal server at {self.listen_sock.getsockname()}")
 
         with self.election_lock:
-            self.last_leader_heartbeat = time.time()
             self.election_timeout = random.uniform(
                 5 * self.hb_int, self.max_election_timeout
             )
@@ -221,7 +223,12 @@ class Proxy:
         self.internal_started.wait()
 
         self.api.register_blueprint(api_bp)
-        self.api.run(use_reloader=False)
+        self.api.run(use_reloader=False, threaded=True)
+
+    def discover_peers(self) -> set[str]:
+        addrs = set(r.address for r in resolver.resolve(self.service_dns, "A"))
+        addrs -= self.ips  # remove self
+        return addrs
 
     ### EXTERNAL API HELPERS
     def _before_api_request(self):
@@ -333,34 +340,34 @@ class Proxy:
         return {}, 200
 
     ### INTERNAL
-    def _connect_to_peer(self, peer_id: int, raise_exc: bool = False):
+    def _connect_to_peer(self, host: str, raise_exc: bool = False):
         """
         Attempt to establish a socket connection to a peer if no connection
         exists, yet.
         """
-        assert peer_id in self.replicas
-        addr = self.replicas[peer_id]
-
         with self.connections_lock:
-            if peer_id in self.connections:
-                ts, data = self.connections[peer_id]
-                time_since_last_hs = (time.time() - ts) * 1000
-                if time_since_last_hs > 3 * self.hb_int:
-                    # We haven't heard from this connection in a while,
-                    # make sure that it still works
-                    self.__initiate_handshake(data())
+            conn = self.connections.get(host)
 
-                return
+        if conn is not None:
+            ts, data = conn
+            time_since_last_hs = (time.time() - ts) * 1000
+            if time_since_last_hs > 3 * self.hb_int:
+                # We haven't heard from this connection in a while,
+                # make sure that it still works
+                self.__initiate_handshake(data())
+
+            return
 
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            host, port = addr.split(":")
-            sock.connect((host, int(port)))
+            sock.connect((host, self.internal_port))
 
             # Store connection
-            data = SocketData(addr, sock)
-            data.id = peer_id
-            self.selector.register(sock, RD, data=data)
+            data = SocketData(host, sock)
+            logger.debug(f"connecting..., {data}")
+            with self.selector_lock:
+                self.selector.register(sock, RD, data=data)
+
             self._update_connection(data)
 
             # Tell the other replica about us
@@ -376,19 +383,18 @@ class Proxy:
         Continuously try to establish connections to all other replicas.
         Should be run in a separate thread.
         """
-        self.threads: dict[int, Thread] = {}
-        while not self.stop_event.is_set():
-            for peer_id in self.replicas:
-                if peer_id == self.server_id:
-                    continue
+        threads: dict[str, Thread] = {}
 
-                if peer_id in self.threads and self.threads[peer_id].is_alive():
+        while not self.stop_event.is_set():
+            self.peers = self.discover_peers()
+            for host in self.peers:
+                if host in threads and threads[host].is_alive():
                     # Avoid spamming threads unnecessarily
                     continue
 
-                th = Thread(target=self._connect_to_peer, args=(peer_id,), daemon=True)
+                th = Thread(target=self._connect_to_peer, args=(host,), daemon=True)
                 th.start()
-                self.threads[peer_id] = th
+                threads[host] = th
 
             time.sleep(self.hb_int / 1000)
 
@@ -410,31 +416,31 @@ class Proxy:
         """
         with data.inb_lock:
             if len(data.inb) < 4:
-                return b"", b""
+                return
 
             magic = data.inb[:4]
             if magic != MAGIC:
                 raise ValueError("Invalid request type.")
 
             if len(data.inb) < 5:
-                return b"", b""
+                return
 
             version = int.from_bytes(data.inb[4:5], "big", signed=False)
             if version != PROTOCOL_VERSION:
                 raise ValueError("Unknown request version.")
 
             if len(data.inb) < 6:
-                return b"", b""
+                return
 
             command = data.inb[5:6]
 
             if len(data.inb) < 10:
-                return b"", b""
+                return
 
             payload_length = int.from_bytes(data.inb[6:10], "big", signed=False)
             payload = data.inb[10 : 10 + payload_length]
             if len(payload) < payload_length:
-                return b"", b""
+                return
 
             # If we made it here, we received a complete request. Consume all of the
             # data of this request, and return the extracted command + payload
@@ -460,43 +466,43 @@ class Proxy:
             )
 
         # Mark socket as writeable again so that `select` picks it up
-        self.selector.modify(data.sock, RD | WR, data=data)
+        with self.selector_lock:
+            self.selector.modify(data.sock, RD | WR, data=data)
 
     def _remove_connection(self, sock: socket.socket, data: SocketData):
         """
         Remove a socket connection and its corresponding `SocketData`
         object from `connections` dictionary and the selector.
         """
-        if data.id is not None:
+        if data.host is not None:
             with self.connections_lock:
-                _ = self.connections.pop(data.id, None)
+                _ = self.connections.pop(data.host, None)
 
-        logger.debug(f"Closing connection to {data.addr}")
+        logger.debug(f"Closing connection to {data.host}")
 
         try:
-            self.selector.unregister(sock)
+            with self.selector_lock:
+                self.selector.unregister(sock)
             sock.close()
 
         except Exception:
             pass
 
     def _send_to_peer(
-        self, peer_id: int, command: bytes, payload: bytes, raise_exc: bool = False
+        self, host: str, command: bytes, payload: bytes, raise_exc: bool = False
     ):
         """
         Attempt to send a message to a peer.
         """
-        assert peer_id in self.replicas
-        addr = self.replicas[peer_id]
-
-        self._connect_to_peer(peer_id, raise_exc=raise_exc)
+        self._connect_to_peer(host, raise_exc=raise_exc)
 
         try:
             with self.connections_lock:
-                ts, data = self.connections[peer_id]
-                self._prepare_send(data(), command, payload)
+                _, data = self.connections[host]
 
-            logger.debug(f"Message to {addr}: cmd={command}, pl={payload}")
+            self._prepare_send(data(), command, payload)
+
+            logger.debug(f"Message to {host}: cmd={command}, pl={payload}")
 
         except Exception as e:
             # logger.warning(f"Unable to send message to {peer_id} ({addr}): {str(e)}")
@@ -507,11 +513,8 @@ class Proxy:
         """
         Attempt to send a message to all peers (not including self).
         """
-        for id in self.replicas:
-            if id == self.server_id:
-                continue
-
-            self._send_to_peer(id, command, payload)
+        for host in self.discover_peers():
+            self._send_to_peer(host, command, payload)
 
     def _accept(self, sock: socket.socket):
         """
@@ -521,7 +524,8 @@ class Proxy:
         logger.debug(f"Accepted connection {conn} from {addr}")
         conn.setblocking(False)
 
-        self.selector.register(conn, RD, data=SocketData(addr, conn))
+        with self.selector_lock:
+            self.selector.register(conn, RD, data=SocketData(addr[0], conn))
 
     def _service(self, key: selectors.SelectorKey, mask: int):
         """
@@ -533,7 +537,7 @@ class Proxy:
         if mask & RD:
             recv = b""
             try:
-                recv = sock.recv(1024)  # receive in chunks of 1024 bytes
+                recv = sock.recv(4096)  # receive in chunks of 4096 bytes
                 if not recv:
                     raise ConnectionResetError
 
@@ -546,22 +550,21 @@ class Proxy:
                 data.inb += recv
 
             try:
-                cmd, payload = self._receive(data)
-                if cmd:
-                    logger.debug(f"Request ({data.addr}): cmd={cmd}, pl={payload}")
+                while res := self._receive(data):
+                    cmd, payload = res
+                    logger.debug(f"Request ({data.host}): cmd={cmd}, pl={payload}")
                     th = Thread(target=self._handle, args=(data, cmd, payload))
                     th.daemon = True
                     th.start()
-                    # self._handle(data, cmd, payload)
 
             except ValueError as e:
-                logger.warning(f"Invalid request ({data.addr}): {str(e)}")
+                logger.warning(f"Invalid request ({data.host}): {str(e)}")
                 logger.error(e, exc_info=True)
                 self._remove_connection(sock, data)
 
         with data.outb_lock:
             if mask & WR and data.outb:
-                logger.debug(f"Returning data {data.outb} to {data.addr}")
+                logger.debug(f"Returning data {data.outb} to {data.host}")
                 try:
                     sent = sock.send(data.outb)
 
@@ -571,7 +574,8 @@ class Proxy:
                     data.outb = data.outb[sent:]
                     if not data.outb:
                         # This avoids excessive polling
-                        self.selector.modify(data.sock, RD, data=data)
+                        with self.selector_lock:
+                            self.selector.modify(data.sock, RD, data=data)
 
                 except OSError:
                     self._remove_connection(sock, data)
@@ -644,12 +648,15 @@ class Proxy:
         once all queues have received at least one object or timeout.
         """
         results = {}
+        stop = Event()
+        logger.debug(f"Waiting for keys {keys}")
 
         def _poll(keys: set):
-            while not keys.issubset(results.keys()):
+            while not keys.issubset(results.keys()) and not stop.is_set():
                 for key in keys - results.keys():
                     try:
-                        result = self.queues[key].get_nowait()
+                        with self.queue_lock:
+                            result = self.queues[key].get_nowait()
                         results[key] = result
 
                     except Empty:
@@ -660,20 +667,30 @@ class Proxy:
         th = Thread(target=_poll, args=(set(keys),), daemon=True)
         th.start()
         th.join(timeout)
+        stop.set()
+
+        logger.debug(f"Done waiting for keys {keys}")
 
         # Clean up
         with self.queue_lock:
             for key in keys:
+                logger.debug(f"Removing {key} from queues")
                 self.queues.pop(key)
+
+        logger.debug(f"Cleaned up keys {keys}")
 
         return results
 
     def _update_connection(self, data: SocketData):
-        if data.id is None:
+        if data.host is None:
             return
 
         with self.connections_lock:
-            self.connections[data.id] = (time.time(), weakref.ref(data))
+            self.connections[data.host] = (time.time(), weakref.ref(data))
+
+        with self.election_lock:
+            if data.host is not None and data.host == self.leader:
+                self.election_timer.restart()
 
     def _handle_weak_queries(self):
         """
@@ -709,10 +726,10 @@ class Proxy:
     ### INTERNAL ACTIONS
     def __initiate_handshake(self, data: SocketData):
         """Identify self to other replica."""
-        payload = self.server_id.to_bytes(4, "big", signed=False)
+        # payload = self.server_id.to_bytes(4, "big", signed=False)
 
         with self.clock_lock:
-            payload += self.clock.to_bytes(4, "big", signed=False)
+            payload = self.clock.to_bytes(4, "big", signed=False)
 
         with self.election_lock:
             if self.status == "leader":
@@ -722,9 +739,9 @@ class Proxy:
 
     def __receive_handshake(self, data: SocketData, payload: bytes):
         """Process identification from other replica."""
-        data.id = int.from_bytes(payload[:4], "big", signed=False)
+        # data.id = int.from_bytes(payload[:4], "big", signed=False)
         self._update_connection(data)
-        logger.debug(f"Received handshake from {data.id}.")
+        logger.debug(f"Received handshake from {data.host}.")
 
         clock = int.from_bytes(payload[4:8], "big", signed=False)
 
@@ -732,22 +749,19 @@ class Proxy:
         if is_leader == b"\x01":
             with self.election_lock:
                 if not self.in_election:
+                    self.leader = data.host
                     logger.debug(f"Accepted leader {self.leader}.")
-                    self.leader = data.id
 
-        # TODO: check if this can create deadlock bc of ordering
-        with self.election_lock:
-            with self.clock_lock:
-                if clock > self.clock:
-                    self.status = "learner"
-                    self._start_learning()
+        with self.clock_lock:
+            if clock > self.clock:
+                self._start_learning()
 
     def __return_handshake(self, data: SocketData):
         """Identify self to other replica in response to handshake."""
-        payload = self.server_id.to_bytes(4, "big", signed=False)
+        # payload = self.server_id.to_bytes(4, "big", signed=False)
 
         with self.clock_lock:
-            payload += self.clock.to_bytes(4, "big", signed=False)
+            payload = self.clock.to_bytes(4, "big", signed=False)
 
         with self.election_lock:
             if self.status == "leader":
@@ -764,11 +778,7 @@ class Proxy:
             if self.status == "leader":
                 # Reject the election, announce ourselves as leader
                 self._prepare_send(data, b"V", payload + b"\x00")
-                self._prepare_send(
-                    data,
-                    b"W",
-                    self.server_id.to_bytes(4, "big", signed=False),
-                )
+                self._prepare_send(data, b"W", b"")
                 return
 
         if term < self.term:
@@ -790,13 +800,20 @@ class Proxy:
         logger.debug(f"Received vote from {payload[:8]}: {response}.")
 
         with self.queue_lock:
-            self.queues[(payload[:8], data.id)].put(response)
+            if (payload[:8], data.host) not in self.queues:
+                logger.info(
+                    f"Received result from unknown election {(payload[:8], data.host)}"
+                )
+            else:
+                logger.debug(f"Accessing queue {(payload[:8], data.host)}")
+                self.queues[(payload[:8], data.host)].put(response)
 
     def __process_winner(self, data: SocketData, payload: bytes):
         """Process winner declaration from other replica."""
         with self.election_condition:
-            self.leader = int.from_bytes(payload[:4], "big", signed=False)
-            assert self.leader in self.replicas
+            self.leader = data.host
+            # self.leader = int.from_bytes(payload[:4], "big", signed=False)
+            # assert self.leader in self.replicas
 
             logger.info(f"Accepted {self.leader} as new leader.")
 
@@ -806,43 +823,49 @@ class Proxy:
 
     def __process_strong_query(self, data: SocketData, payload: bytes):
         """Attempt a proposed strong query, return the status."""
+        with self.clock_condition:
+            while self.strong_query_in_progress:
+                self.clock_condition.wait()
+
+            self.strong_query_in_progress = True
+
         try:
-            # TODO: replace clock by query.logical_timestamp
-            clock = int.from_bytes(payload[:4], "big", signed=False)
-            query = Query.decode(payload[4:])
+            query = Query.decode(payload)
             r_payload = query.transaction_id
 
-            logger.debug(f"Attempting strong query {query} @ {clock}.")
+            logger.debug(
+                f"Attempting strong query {query} @ {query.logical_timestamp}."
+            )
 
+            learner = False
             with self.election_lock:
-                if self.status == "learner":
-                    status = 255
-                    r_payload += status.to_bytes(2, "big", signed=False)
-                    self._prepare_send(data, b"R", r_payload)
-                    return
+                learner |= self.status == "learner"
 
             with self.clock_lock:
-                if clock > self.clock:
-                    # We're missing some information but aren't learning yet
-                    self._start_learning()
-                    status = 255
-                    r_payload += status.to_bytes(2, "big", signed=False)
-                    self._prepare_send(data, b"R", r_payload)
-                    return
+                learner |= query.logical_timestamp > self.clock
 
-                assert clock == self.clock
+            if learner:
+                self._start_learning()
+                status = 255
+                r_payload += status.to_bytes(2, "big", signed=False)
+                self._prepare_send(data, b"R", r_payload)
+                return
 
-                # Use ID, logical timestamp, and timestamp from leader
-                status, _ = self.db.write_query(
-                    query,
-                    "strong",
-                    query.transaction_id,
-                    query.logical_timestamp,
-                    query.timestamp,
-                )
+            # Use ID, logical timestamp, and timestamp from leader
+            status, _ = self.db.write_query(
+                query,
+                "strong",
+                query.transaction_id,
+                query.logical_timestamp,
+                query.timestamp,
+            )
 
+            with self.clock_condition:
                 if status == 0:
                     self.clock += 1
+
+                self.strong_query_in_progress = False
+                self.clock_condition.notify_all()
 
         except ValueError as e:
             logger.warning(f"Unable to parse query from payload {payload}")
@@ -872,11 +895,12 @@ class Proxy:
             if req_id not in self.queues:
                 logger.warning("Received status of unknown query...")
             else:
+                logger.debug(f"Accessing queue {req_id}")
                 self.queues[req_id].put(query_status)
 
     def __distribute_query(self, data: SocketData, payload: bytes):
         """Send a query out to the other replicas."""
-        status = self.propose_query(Query.decode(payload[2:]))  # blocks
+        status, _ = self.propose_query(Query.decode(payload[2:]))  # blocks
         self._prepare_send(
             data, b"S", payload[:2] + status.to_bytes(2, "big", signed=False)
         )
@@ -889,10 +913,11 @@ class Proxy:
         logger.debug(f"GOT QUERY RESULT query_id={query_id}, status={query_status}")
 
         with self.queue_lock:
-            if (query_id, data.id) not in self.queues:
+            if (query_id, data.host) not in self.queues:
                 logger.warning("Collected status of unknown query...")
             else:
-                self.queues[(query_id, data.id)].put(query_status)
+                logger.debug(f"Accessing queue {(query_id, data.host)}")
+                self.queues[(query_id, data.host)].put(query_status)
 
     def __teach(self, data: SocketData, payload: bytes):
         """Teach a follower about the requested query from the strong log."""
@@ -926,6 +951,7 @@ class Proxy:
     def __learn(self, data: SocketData, payload: bytes):
         """Process an earlier query from the strong log."""
         with self.queue_lock:
+            logger.debug(f"Accessing queue {payload[:4]}")
             self.queues[payload[:4]].put(payload[4:])
 
     def _start_learning(self):
@@ -935,9 +961,10 @@ class Proxy:
         continuously increase the counter.
         """
         with self.election_lock:
-            if self.in_election or self.leader is None:
+            if self.in_election or self.leader is None or self.status != "follower":
                 return
 
+            logger.debug("BECOMING A LEARNER!")
             self.status = "learner"
 
         def _keep_learning():
@@ -947,17 +974,19 @@ class Proxy:
 
                 with self.queue_lock:
                     queue = Queue()
+                    logger.debug(f"Creating queue {next_log}")
                     self.queues[next_log] = queue
 
                 with self.election_lock:
                     if self.in_election or self.leader is None:
                         break
 
-                    leader_id = self.leader
+                    leader = self.leader
 
                 with self.connections_lock:
-                    _, data = self.connections[leader_id]
-                    self._prepare_send(data(), b"T", next_log)
+                    _, data = self.connections[leader]
+
+                self._prepare_send(data(), b"T", next_log)
 
                 # Wait for result
                 result = queue.get()
@@ -965,6 +994,7 @@ class Proxy:
 
                 # Clean up queues
                 with self.queue_lock:
+                    logger.debug(f"Removing queue {next_log}")
                     self.queues.pop(next_log)
 
                 if status == b"\x00":
@@ -1011,48 +1041,56 @@ class Proxy:
             Call election disregarding last heartbeat from leader, by default False.
         """
         logger.debug("Testing election...")
-        with self.election_condition:
-            logger.debug(f"Old leader: {self.leader}")
+        with self.election_lock:
+            logger.debug(
+                f"Old leader: {self.leader}, status: {self.status}, in_election: {self.in_election}"
+            )
             if self.in_election or self.status != "follower":
                 return
 
-            with self.connections_lock:
-                if self.leader in self.connections:
-                    ts, _ = self.connections[self.leader]
-                    if (time.time() - ts) * 1000 <= self.election_timeout:
-                        # No need to call an election just yet...
-                        logger.debug("no need for election just yet...")
-                        self.election_timer.restart()
-                        if not force:
-                            return
+        with self.connections_lock:
+            leader_conn = self.connections.get(self.leader)
 
+        if leader_conn is not None:
+            ts, _ = leader_conn
+            if (time.time() - ts) * 1000 <= self.election_timeout:
+                # No need to call an election just yet...
+                logger.debug("no need for election just yet...")
+                self.election_timer.restart()  # thread-safe
+
+                if not force:
+                    return
+
+        with self.election_lock:
             self.in_election = True
             self.leader = None
 
-            # Prepare response queues for current term
-            with self.clock_lock:
-                t = self.term.to_bytes(8, "big", signed=False)
-                logger.info(f"STARTING ELECTION WITH TERM {self.term}")
+        logger.debug("Starting election soon...")
 
-            for id in self.replicas:
-                if id == self.server_id:
-                    continue
+        # Prepare response queues for current term
+        with self.clock_lock:
+            t = self.term.to_bytes(8, "big", signed=False)
+            logger.info(f"STARTING ELECTION WITH TERM {self.term}")
 
-                with self.queue_lock:
-                    self.queues[(t, id)] = Queue()
+        for host in self.discover_peers():
+            with self.queue_lock:
+                logger.debug(f"Creating queue {(t, host)}")
+                self.queues[(t, host)] = Queue()
 
-            # Inform all replicas of our plans to become the new leader
-            # with our proposed term
-            self._broadcast(b"E", t)
+        # Inform all replicas of our plans to become the new leader
+        # with our proposed term
+        self._broadcast(b"E", t)
 
-            qs_to_watch = []
-            with self.connections_lock:
-                qs_to_watch = [(t, id) for id in self.connections]
+        logger.debug("Broadcasted election")
 
-            # Wait for votes and tally
-            results = self._wait_for_queues(qs_to_watch, timeout=1)
-            votes = sum(r for r in results.values())
+        with self.connections_lock:
+            qs_to_watch = [(t, host) for host in self.connections]
 
+        # Wait for votes and tally
+        results = self._wait_for_queues(qs_to_watch, timeout=1)
+        votes = sum(r for r in results.values())
+
+        with self.election_condition:
             # Only declare self to be new leader if *all* currently online
             # replicas agree; to obtain stronger consistency guarantees, we
             # can require that the number of voting members has to be at least
@@ -1062,16 +1100,17 @@ class Proxy:
             if votes >= len(qs_to_watch):
                 # We're the new leader!
                 self.status = "leader"
-                self.leader = self.server_id
+                self.leader = self.ips.copy().pop()
                 logger.info(
-                    f"Server {self.server_id} is declaring itself the new leader!"
+                    f"Server {self.server_id} @ {self.ips} is declaring itself the new leader!"
                 )
-                self._broadcast(b"W", self.server_id.to_bytes(4, "big", signed=False))
+                self._broadcast(b"W", b"")
             else:
                 # Keep checking for elections
                 self.election_timer.restart()
 
             # End this election
+            logger.debug("Quitting election")
             self.in_election = False
             self.election_condition.notify_all()
 
@@ -1090,7 +1129,7 @@ class Proxy:
 
         if self.status == "leader":
             self.election_condition.release()
-            logger.debug("As leaser, we propose query directly")
+            logger.debug("As leader, we propose query directly")
             status, query = self.propose_query(query)  # blocks
             return status
 
@@ -1099,6 +1138,7 @@ class Proxy:
         with self.queue_lock:
             req = self.req_id
             self.req_id = (self.req_id + 1) % (1 << 16)
+            logger.debug(f"Creating queue {req}")
             self.queues[req] = Queue()
 
         self._send_to_peer(
@@ -1110,13 +1150,17 @@ class Proxy:
 
         # Clean up
         with self.queue_lock:
+            logger.debug(f"Deleting queue {req}")
             self.queues.pop(req)
 
         return result
 
     def propose_query(self, query: Query) -> tuple[int, Query]:
-        # Try query in leader
-        with self.clock_lock:
+        with self.clock_condition:
+            while self.strong_query_in_progress:
+                self.clock_condition.wait()
+
+            self.strong_query_in_progress = True
             status, query = self.db.write_query(
                 query,
                 "strong",
@@ -1128,28 +1172,22 @@ class Proxy:
 
         logger.debug(f"Implemented in leader {query}")
 
-        with self.clock_lock:
-            payload = self.clock.to_bytes(4, "big", signed=False) + query.encode()
-            self.clock += 1
-
         # If leader is able to implement the query, then all of the
         # followers will be able to do it, too.
 
         # Create queues for responses
-        for id in self.replicas:
-            if id == self.server_id:
-                continue
-
+        for host in self.discover_peers():
             with self.queue_lock:
-                self.queues[(query.transaction_id, id)] = Queue()
+                logger.debug(f"Creating queue {(query.transaction_id, host)}")
+                self.queues[(query.transaction_id, host)] = Queue()
 
         # Attempt to establish connection with all replicas
-        self._broadcast(b"P", payload)
+        self._broadcast(b"P", query.encode())
 
         logger.debug(f"Broadcasted {query}")
 
         with self.connections_lock:
-            qs_to_watch = [(query.transaction_id, id) for id in self.connections]
+            qs_to_watch = [(query.transaction_id, host) for host in self.connections]
 
         # Wait for all of the queries to return (up to some timeout)
         results = self._wait_for_queues(qs_to_watch, timeout=1)
@@ -1163,7 +1201,20 @@ class Proxy:
         # It may be that there are no other replicas, in which case
         # we are trivially successful. We can again do an additional,
         # Raft-like check to ensure that we got a majority of votes.
-        if votes >= total:
-            return 0, query
+        with self.clock_condition:
+            if votes >= total:
+                # We only update the clock here to ensure that we
+                #    a) don't block the clock_lock unnecessarily
+                #    b) avoid situations where between executing the
+                #       query in the leader and waiting for the responses
+                #       of the followers, a replica thinks they have
+                #       missed a query (namely, the current one)
+                self.clock += 1
 
-        return 1, query
+                self.strong_query_in_progress = False
+                self.clock_condition.notify_all()
+                return 0, query
+
+            self.strong_query_in_progress = False
+            self.clock_condition.notify_all()
+            return 1, query

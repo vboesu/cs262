@@ -1,5 +1,6 @@
-from collections.abc import Callable
 import threading
+
+from collections.abc import Callable, Hashable
 
 
 class Timer:
@@ -61,3 +62,35 @@ class Timer:
                 self._timer = None
 
     restart = start
+
+
+def build_sql_filters(data: dict, row_id: str = None) -> tuple[str, list]:
+    # filters are chained and currently only support equality
+    # if `row_id` is set, no other filters should be applied but we're
+    # not going to stop you from doing it
+    filters = data.get("filters", {})
+    if row_id is not None:
+        filters["id"] = row_id
+
+    if filters:
+        return (
+            " WHERE " + " AND ".join(f"{k} = ?" for k in filters),
+            list(filters.values()),
+        )
+
+    return "", []
+
+
+def build_select_query(
+    schema: str, data: dict = {}, row_id: Hashable = None
+) -> tuple[str, list]:
+    _columns = (
+        [f"{schema}.{col}" for col in data["columns"]]
+        if "columns" in data
+        else [f"{schema}.*"]
+    )
+    _query = f"SELECT {', '.join(_columns)} FROM {schema}"
+
+    f_query, _params = build_sql_filters(data, row_id)
+
+    return _query + f_query, _params

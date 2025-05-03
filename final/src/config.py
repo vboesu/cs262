@@ -1,19 +1,14 @@
 API_CONFIG = {
     "DEBUG": True,
-    "SERVER_NAME": "127.0.0.1:9999",
+    "SERVER_NAME": "0.0.0.0:8000",  # external port: 8000
 }
 
 REPLICA_CONFIG = {
     "SERVER_ID": 1,
-    "REPLICAS": {
-        1: "127.0.0.1:10001",
-        2: "127.0.0.1:20002",
-        3: "127.0.0.1:30003",
-        4: "127.0.0.1:40004",
-    },
-    "INSTANCE_PATH": "instance_1",
-    "HEARTBEAT_INTERVAL_MS": 1_000,
-    "ELECTION_TIMEOUT_MS": 6_000,
+    "REPLICAS": {},
+    "INSTANCE_PATH": "instance",
+    "HEARTBEAT_INTERVAL_MS": 100,
+    "ELECTION_TIMEOUT_MS": 1_000,
     "STRONG_CONSISTENCY": [],
     "SETUP_SCRIPT": "setup.sql",
 }
@@ -43,5 +38,5 @@ LOGGING_CONFIG = {
             "encoding": "utf-8",
         },
     },
-    "root": {"level": "DEBUG", "handlers": ["console", "file"]},
+    "root": {"level": "INFO", "handlers": ["console", "file"]},
 }

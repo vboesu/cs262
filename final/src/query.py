@@ -1,6 +1,5 @@
-from datetime import datetime
-
 from collections.abc import Hashable
+from datetime import datetime
 from typing import Any, Literal
 
 from codec import default_encoder
@@ -191,6 +190,9 @@ class Query(object):
     def __init__(self, ops: list[Operation]):
         self.ops = ops
 
+    def __repr__(self) -> str:
+        return f"Query(transaction_id={self.transaction_id}, logical_timestamp={self.logical_timestamp}, timestamp={self.timestamp})"
+
     def __getattr__(self, name: str) -> Any:
         if name in {"timestamp", "logical_timestamp", "transaction_id"}:
             if len(self.ops) == 0:
@@ -205,7 +207,6 @@ class Query(object):
         return super().__getattr__(name)
 
     def __setattr__(self, name: str, value: Any) -> Any:
-        print(f"setting attribute {name} to {value}")
         if name == "timestamp":
             value = value or datetime.now()
 

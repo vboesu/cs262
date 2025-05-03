@@ -1,0 +1,28 @@
+version: "3.8"
+
+services:
+  bvdb:
+    image: bvdb:latest
+    environment:
+      - SERVER_ID={{.Task.Slot}}
+      - INTERNAL_PORT=8001
+      - EXTERNAL_PORT=8000
+      - SERVICE_DNS=tasks.bvdb
+      - N_REPLICAS=5
+    expose:
+      - 8001 # internal socket port for peers
+    ports:
+      - target: 8000 # port to which each replica binds to
+        published: 8888 # host port to access from the outside
+        protocol: tcp
+        mode: ingress # load balancer
+    networks:
+      - app_net
+    deploy:
+      replicas: 5
+      restart_policy:
+        condition: none
+
+networks:
+  app_net:
+    external: true

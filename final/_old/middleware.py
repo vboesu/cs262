@@ -4,7 +4,7 @@ from pypgoutput import decode_message
 
 # Connection string to your PostgreSQL database
 # conn_str = "dbname=postgres user=postgres host=localhost port=12345"
-conn_str = "postgres://postgres:admin@127.0.0.1:55432/postgres"
+conn_str = "postgres://postgres:password@127.0.0.1:5433/postgres"
 
 # Use a replication connection
 conn = psycopg2.connect(
@@ -14,7 +14,7 @@ cur = conn.cursor()
 
 # Attempt to create a replication slot if it doesn't already exist.
 # You might wrap this in a try/except in production.
-slot_name = "test_logical_slot"
+slot_name = "logical_slot"
 try:
     cur.create_replication_slot(slot_name, output_plugin="pgoutput")
 except psycopg2.ProgrammingError as e:
@@ -50,7 +50,7 @@ def replication_callback(msg):
 try:
     cur.start_replication(
         slot_name=slot_name,
-        options={"proto_version": "1", "publication_names": "mypublication"},
+        options={"proto_version": "1", "publication_names": "all_writes"},
         decode=False,
     )
     cur.consume_stream(replication_callback)
