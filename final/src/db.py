@@ -4,10 +4,10 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
-from query import Query
+from .query import Query
 
 logger = logging.getLogger(__name__)
 
@@ -27,13 +27,15 @@ class SQLiteDatabase:
                 self.conn.commit()
 
         self.tables = self._public_tables()
-        print("available tables", self.tables)
+        logger.info("Available tables: %s", self.tables)
 
     @staticmethod
-    def _dict_factory(cursor: sqlite3.Cursor, row: tuple):
+    def _dict_factory(cursor: sqlite3.Cursor, row: tuple) -> dict[str, Any]:
         d = {}
+
         for idx, col in enumerate(cursor.description):
             d[col[0]] = row[idx]
+
         return d
 
     def _ensure_meta(self):

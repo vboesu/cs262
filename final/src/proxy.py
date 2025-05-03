@@ -18,10 +18,10 @@ from typing import Literal
 from dns import resolver
 from flask import Flask, g
 
-from api import api as api_bp
-from db import SQLiteDatabase
-from query import Operation, Query
-from utils import Timer, build_select_query
+from .api import api as api_bp
+from .db import SQLiteDatabase
+from .query import Operation, Query
+from .utils import Timer, build_select_query
 
 logger = logging.getLogger(__name__)
 
@@ -129,8 +129,12 @@ class Proxy:
 
     @cached_property
     def ips(self):
-        _, _, addrs = socket.gethostbyname_ex(socket.gethostname())
-        return set(addrs)
+        try:
+            _, _, addrs = socket.gethostbyname_ex(socket.gethostname())
+            return set(addrs)
+
+        except socket.error:
+            return {}
 
     ### SETUP & START
     def start(self):
@@ -212,6 +216,7 @@ class Proxy:
         self.api.before_request(self._before_api_request)
 
         # Load configuration
+        self.ac["SERVER_NAME"] = f"0.0.0.0:{self.external_port}"
         if isinstance(self.ac, dict):
             self.api.config.from_mapping(self.ac)
         elif isinstance(self.ac, (str, object)):
@@ -743,9 +748,9 @@ class Proxy:
         self._update_connection(data)
         logger.debug(f"Received handshake from {data.host}.")
 
-        clock = int.from_bytes(payload[4:8], "big", signed=False)
+        clock = int.from_bytes(payload[:4], "big", signed=False)
 
-        is_leader = payload[8:]
+        is_leader = payload[4:]
         if is_leader == b"\x01":
             with self.election_lock:
                 if not self.in_election:
@@ -870,6 +875,7 @@ class Proxy:
         except ValueError as e:
             logger.warning(f"Unable to parse query from payload {payload}")
             logger.error(e, exc_info=True)
+            r_payload = b"\x00" * 16
             status = 99
 
         r_payload += status.to_bytes(2, "big", signed=False)
@@ -1168,7 +1174,7 @@ class Proxy:
             )
 
         if status != 0:
-            return status
+            return status, query
 
         logger.debug(f"Implemented in leader {query}")
 

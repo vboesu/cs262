@@ -2,7 +2,7 @@ from collections.abc import Hashable
 from datetime import datetime
 from typing import Any, Literal
 
-from codec import default_encoder
+from .codec import default_encoder
 
 Command = Literal[b"I", b"U", b"D"]
 

@@ -8,7 +8,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 2) copy your app
-COPY app .
+COPY src src
 
 # for external API access
 EXPOSE 8000

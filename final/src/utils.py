@@ -25,7 +25,7 @@ class Timer:
         self.kwargs = kwargs
 
         self._timer: threading.Timer = None
-        self._lock: threading.Lock = threading.RLock()
+        self._lock = threading.RLock()
 
     def _run(self):
         """

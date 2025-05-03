@@ -1,14 +1,9 @@
-import os
-import time
 import config
 import logging.config
-import dns.resolver
 
-from proxy import Proxy
+from src.proxy import Proxy
 
 logging.config.dictConfig(config.LOGGING_CONFIG)
-
-SERVER_ID = int(os.getenv("SERVER_ID"))
 
 
 if __name__ == "__main__":
@@ -17,7 +12,6 @@ if __name__ == "__main__":
     replica_config = config.REPLICA_CONFIG.copy()
     replica_config.update(
         {
-            "SERVER_ID": SERVER_ID,
             "STRONG_CONSISTENCY": [
                 "users.username",
                 "users.password_hash",
