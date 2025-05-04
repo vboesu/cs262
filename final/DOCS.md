@@ -1,6 +1,8 @@
 # Hybrid-Consistency Replicated Database
 Our final project implements a replicated database system, where data in specified tables and columns is kept strongly consistent with other data defaulting to eventual consistency. This setup is particularly interesting for use cases with mostly reads or with frequent reads and writes which do not require strong consistency.
 
+For a more detailed documentation, see our [Report](report.pdf).
+
 ### Interface
 Interactions with the database happen through a REST-style HTTP API. The HTTP request methods map to database operations according to the following table.
 
