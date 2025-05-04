@@ -3,11 +3,16 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# 1) install deps
+# Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 2) copy your app
+# Copy meta files
+COPY config.py .
+COPY run.py .
+COPY setup.sql .
+
+# Copy the source code
 COPY src src
 
 # for external API access

@@ -163,7 +163,7 @@ class Proxy:
 
         with self.election_lock:
             self.election_timeout = random.uniform(
-                5 * self.hb_int, self.max_election_timeout
+                6 * self.hb_int, self.max_election_timeout
             )
             self.election_timer = Timer(
                 self.election_timeout / 1000, self.call_election
@@ -281,24 +281,30 @@ class Proxy:
                 self.strong_columns & set(f"{schema}.{col}" for col in data.keys())
             )
 
-            # First, we need to make sure that the element exists
-            status, result = self.db.try_execute(
-                f"SELECT {', '.join(data.keys())} FROM {schema} WHERE id = ?", [row_id]
-            )
-            if len(result) != 1:
-                # This row does not (yet) exist. Error in the case of strong query,
-                # temporary error/merge conflict (potentially wait for data to arrive)
-                # in the case of weak query. For now, throw an error.
-                # TODO: for updates, should it be part of the client's code to keep track
-                # of what the old value is? Probably, since it is most likely that race
-                # conditions happen between the client seeing a row and deciding to edit it
-                # rather than telling the server to edit it (and the server just taking
-                # whatever value it currently has as the one that the client last saw)
-                return {"error": "Temporary error."}, 400
+            # # First, we need to make sure that the element exists
+            # status, result = self.db.try_execute(
+            #     f"SELECT {', '.join(data.keys())} FROM {schema} WHERE id = ?", [row_id]
+            # )
+            # if len(result) != 1:
+            #     # This row does not (yet) exist. Error in the case of strong query,
+            #     # temporary error/merge conflict (potentially wait for data to arrive)
+            #     # in the case of weak query. For now, throw an error.
+            #     # TODO: for updates, should it be part of the client's code to keep track
+            #     # of what the old value is? Probably, since it is most likely that race
+            #     # conditions happen between the client seeing a row and deciding to edit it
+            #     # rather than telling the server to edit it (and the server just taking
+            #     # whatever value it currently has as the one that the client last saw)
+            #     return {"error": "Temporary error."}, 400
 
-            # Next, we can update each field individually
+            for col in data.keys():
+                if not isinstance(data[col], list) or len(data[col]) != 2:
+                    return {
+                        "error": "Please provide (old_value, new_value) for each column you want to update."
+                    }, 400
+
+            # Next, update each field individually
             ops = [
-                Operation(b"U", schema, col, row_id, result[0][col], data[col])
+                Operation(b"U", schema, col, row_id, data[col][0], data[col][1])
                 for col in data.keys()
             ]
             query = Query(ops)
@@ -310,13 +316,12 @@ class Proxy:
             # Strong query if any of the affected columns are strong
             strong = schema in [col.split(".")[0] for col in self.strong_columns]
 
-            # First, we need to make sure that the element exists
+            # Make sure that the element exists
             status, result = self.db.try_execute(
                 f"SELECT id FROM {schema} WHERE id = ?", [row_id]
             )
             if len(result) != 1:
-                # Same note as in UPDATE
-                return {"error": "Temporary error."}, 400
+                return {"error": "Not found."}, 404
 
             query = Query([Operation(b"D", schema, row=row_id)])
 
@@ -356,7 +361,7 @@ class Proxy:
         if conn is not None:
             ts, data = conn
             time_since_last_hs = (time.time() - ts) * 1000
-            if time_since_last_hs > 3 * self.hb_int:
+            if time_since_last_hs > 4 * self.hb_int:
                 # We haven't heard from this connection in a while,
                 # make sure that it still works
                 self.__initiate_handshake(data())
@@ -558,6 +563,7 @@ class Proxy:
                 while res := self._receive(data):
                     cmd, payload = res
                     logger.debug(f"Request ({data.host}): cmd={cmd}, pl={payload}")
+                    self._update_connection(data)
                     th = Thread(target=self._handle, args=(data, cmd, payload))
                     th.daemon = True
                     th.start()
@@ -694,8 +700,11 @@ class Proxy:
             self.connections[data.host] = (time.time(), weakref.ref(data))
 
         with self.election_lock:
-            if data.host is not None and data.host == self.leader:
-                self.election_timer.restart()
+            if not self.in_election:
+                if data.host is not None and data.host == self.leader:
+                    self.election_timer.restart()
+
+        logger.debug(f"Updated connection with {data.host}")
 
     def _handle_weak_queries(self):
         """
@@ -705,7 +714,7 @@ class Proxy:
         while not self.stop_event.is_set():
             try:
                 query = self.async_queue.get(timeout=1)
-                logger.info(f"Got async query {query}")
+                logger.debug(f"Got async query {query}")
                 if query.transaction_id in self.async_transaction_ids:
                     continue
 
@@ -745,7 +754,7 @@ class Proxy:
     def __receive_handshake(self, data: SocketData, payload: bytes):
         """Process identification from other replica."""
         # data.id = int.from_bytes(payload[:4], "big", signed=False)
-        self._update_connection(data)
+        # self._update_connection(data)
         logger.debug(f"Received handshake from {data.host}.")
 
         clock = int.from_bytes(payload[:4], "big", signed=False)
@@ -757,9 +766,15 @@ class Proxy:
                     self.leader = data.host
                     logger.debug(f"Accepted leader {self.leader}.")
 
-        with self.clock_lock:
-            if clock > self.clock:
-                self._start_learning()
+            with self.clock_condition:
+                while self.strong_query_in_progress:
+                    self.clock_condition.wait()
+
+                if clock > self.clock:
+                    logger.info(
+                        f"RECEIVED HIGHER CLOCK ({clock} > {self.clock}) FROM {data.host} (LEADER)"
+                    )
+                    self._start_learning()
 
     def __return_handshake(self, data: SocketData):
         """Identify self to other replica in response to handshake."""
@@ -789,7 +804,6 @@ class Proxy:
         if term < self.term:
             # This server definitely shouldn't be the leader
             self._prepare_send(data, b"V", payload + b"\x00")
-            self.call_election(force=True)
             return
 
         with self.election_lock:
@@ -970,7 +984,7 @@ class Proxy:
             if self.in_election or self.leader is None or self.status != "follower":
                 return
 
-            logger.debug("BECOMING A LEARNER!")
+            logger.info("BECOMING A LEARNER!")
             self.status = "learner"
 
         def _keep_learning():

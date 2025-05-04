@@ -15,9 +15,9 @@ def schema_ops(schema: str):
     if request.content_type == "application/json":
         data.update(request.get_json() or {})
 
-    result = g.proxy.dispatch(request.method, schema, data)
+    result, code = g.proxy.dispatch(request.method, schema, data)
 
-    return result
+    return result, code
 
 
 @api.route("/<schema>/<row_id>", methods=["GET", "PATCH", "DELETE"])
@@ -29,9 +29,9 @@ def row_ops(schema: str, row_id: str):
     if request.content_type == "application/json":
         data.update(request.get_json() or {})
 
-    result = g.proxy.dispatch(request.method, schema, data, row_id)
+    result, code = g.proxy.dispatch(request.method, schema, data, row_id)
 
-    return result
+    return (result[0], code) if len(result) else ({}, code)
 
 
 if __name__ == "__main__":
